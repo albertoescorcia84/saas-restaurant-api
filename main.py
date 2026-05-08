@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import json
 import logging
@@ -22,6 +23,22 @@ TEMPERATURE    = 0.1   # Near-deterministic
 MAX_TOKENS     = 256   # Short chat replies only
 SEED           = 42
 MAX_TOOL_ITERS = 4
+
+# ── Base prompt sanitizer ─────────────────────────────────────────────────────
+# Strips any legacy instructions from old system prompts stored in the DB
+# that could bleed into the FSM flow (e.g. [ORDER_FINALIZED], manage_customer_data, etc.)
+_LEGACY_PATTERNS = re.compile(
+    r"\[ORDER_FINALIZED\]"
+    r"|manage_customer_data"
+    r"|query_vector_database"
+    r"|STRICT PROTOCOL.*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+def sanitize_base_prompt(prompt: str) -> str:
+    """Remove legacy directives from DB-stored prompts before injecting into FSM."""
+    cleaned = _LEGACY_PATTERNS.sub("", prompt)
+    return cleaned.strip()
 
 # ── FSM States ───────────────────────────────────────────────────────────────
 #
@@ -109,8 +126,10 @@ TOOLS_SAVE = [
 
 # ── Prompt builder — one tight prompt per FSM state ──────────────────────────
 def build_prompt(state: str, brand: str, base_prompt: str, session: dict) -> str:
-    base = base_prompt.format(restaurant_name=brand, menu_context="[use query_menu tool]")
-    c    = session["collected"]
+    base = sanitize_base_prompt(base_prompt).format(
+        restaurant_name=brand, menu_context="[use query_menu tool]"
+    )
+    c = session["collected"]
 
     prompts = {
         STATE_ORDER: f"""{base}
@@ -122,6 +141,8 @@ YOUR ONLY JOB NOW:
 - Use query_menu if they ask about dishes, prices, or ingredients.
 - Once the customer confirms their items, call order_ready with a short order_summary.
 - Do NOT ask for name, address, or email at this stage.
+- Do NOT write [ORDER_FINALIZED] or any marker — the system handles that.
+- Do NOT call save_order or save_customer_data — those tools do not exist in this phase.
 - Ask only ONE thing at a time. Be brief and friendly.""",
 
         STATE_ADDR: f"""{base}
@@ -442,6 +463,29 @@ async def chat_endpoint(request: ChatRequest):
                     msg2 = call_llm(client, tenant["model_name"], session["messages"])
                     final_reply = msg2.content or ""
                     break
+
+        # ── Hallucination guard ───────────────────────────────────────────────
+        # If the model wrote a legacy marker or leaked a tool call as plain text
+        # while still in STATE_ORDER, strip it and do NOT advance the FSM.
+        _HALLUC = re.compile(
+            r"\[ORDER_FINALIZED\]"
+            r"|save_customer_data\s*>.*"
+            r"|save_order\s*>.*"
+            r"|<function.*",
+            re.IGNORECASE | re.DOTALL,
+        )
+        if session["status"] == STATE_ORDER and _HALLUC.search(final_reply):
+            logger.warning(f"[guard] Hallucinated marker detected — stripping and staying in STATE_ORDER. reply='{final_reply[:120]}'")
+            final_reply = _HALLUC.sub("", final_reply).strip()
+            # If nothing meaningful is left, ask the model for a clean reply
+            if len(final_reply) < 10:
+                session["messages"].append({
+                    "role": "user",
+                    "content": "[system: your previous reply contained an invalid marker. Respond naturally without any markers or function calls.]"
+                })
+                msg_retry = call_llm(client, tenant["model_name"], session["messages"])
+                final_reply = msg_retry.content or "What would you like to order?"
+                session["messages"].pop(-1)  # remove the injected system nudge
 
         # 6 — Store reply and respond
         session["messages"].append({"role": "assistant", "content": final_reply})
