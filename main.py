@@ -127,6 +127,9 @@ class ChatRequest(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Phase 1 tools: ordering
+# NOTE: order_ready is intentionally REMOVED — the server detects order confirmation
+# from the conversation context. LLaMA was printing it as plain text instead of
+# calling it as a tool, so we moved that responsibility server-side.
 TOOLS_ORDER = [
     {
         "type": "function",
@@ -145,26 +148,6 @@ TOOLS_ORDER = [
                     }
                 },
                 "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "order_ready",
-            "description": (
-                "Call ONLY when the customer has verbally confirmed their final food order. "
-                "Do not call to ask for confirmation — wait until they confirm."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "order_summary": {
-                        "type": "string",
-                        "description": "Confirmed items, e.g. '2x Roast Chicken, 1x Yuca'."
-                    }
-                },
-                "required": ["order_summary"]
             }
         }
     }
@@ -230,20 +213,22 @@ def build_system_prompt(session: Session, brand: str, raw_prompt: str) -> str:
 
     if session.status == State.ORDER:
         customer_line = (
-            f"The customer's name is {c.full_name} — greet them warmly by name in your first message."
+            f"The customer's name is {c.full_name} — greet them warmly by name."
             if session.is_global_customer and c.full_name
             else "You don't know the customer's name yet. Don't ask for it now."
         )
         return (
             f"{base}\n\n"
             f"{customer_line}\n\n"
-            f"You are a friendly order-taking assistant. Your only job right now is to help "
-            f"the customer decide what to eat. Use the query_vector_database tool whenever "
-            f"they ask about dishes, prices, or ingredients — never make up menu items. "
-            f"Once the customer tells you exactly what they want and confirms it, call the "
-            f"order_ready tool with a short summary of the items. "
-            f"Do not ask for their name, address, or email at this stage. "
-            f"Keep your replies short and friendly — one topic at a time."
+            f"You are a warm, conversational order-taking assistant. "
+            f"Help the customer decide what to eat. "
+            f"Use the query_vector_database tool whenever they ask about dishes, prices, or ingredients. "
+            f"Never invent or assume menu items — only use data the tool returns. "
+            f"Do not ask for their name, address, or email — that comes later. "
+            f"Do not write function calls, tags, or markers in your reply. "
+            f"Keep replies short and friendly — one idea at a time. "
+            f"When the customer seems ready to confirm their order, ask them clearly: "
+            f"'Just to confirm — you'd like [items], right?' and wait for a yes or no."
         )
 
     if session.status == State.CHECKOUT:
@@ -503,6 +488,124 @@ def _extract_email(raw: str) -> str:
     return match.group(0) if match else ""
 
 
+def _detect_order_confirmation(
+    llm_reply: str,
+    customer_message: str,
+    conversation: list,
+) -> tuple[bool, str]:
+    """
+    Determine whether the order has been confirmed by the customer.
+
+    Two-phase detection:
+    ─────────────────────────────────────────────────────────────────
+    PHASE A — LLM asked a confirmation question AND customer said YES.
+      The LLM reply contains a confirmation question pattern
+      (e.g. "just to confirm, you'd like X, right?") AND the current
+      customer message is affirmative. We extract the order summary
+      from the LLM's confirmation question.
+
+    PHASE B — Customer message itself explicitly confirms with items.
+      e.g. "yes, I want 1 roast chicken" or "confirm: roast chicken"
+      We extract the items from the customer's own message.
+
+    Returns (confirmed: bool, order_summary: str).
+    order_summary is empty string when confirmed=False.
+    """
+    reply_lower   = llm_reply.lower()
+    customer_lower = customer_message.strip().lower()
+
+    # ── Phase A: LLM asked a confirm question, customer replied YES ────────────
+    _CONFIRM_TRIGGERS = (
+        "just to confirm",
+        "to confirm your order",
+        "confirm —",
+        "confirming your order",
+        "so you'd like",
+        "you'd like",
+        "you want",
+        "your order is",
+        "is that right",
+        "is that correct",
+        "shall i proceed",
+        "ready to place",
+        "place your order",
+    )
+    llm_asked_confirmation = any(t in reply_lower for t in _CONFIRM_TRIGGERS)
+
+    if llm_asked_confirmation and _is_affirmative(customer_message):
+        # Extract the order summary from the LLM's confirmation sentence.
+        # Look for the last assistant message that contained a confirmation question.
+        order_summary = _extract_order_from_text(llm_reply)
+        if order_summary:
+            return True, order_summary
+
+        # Fallback: search the last few assistant messages for one with items
+        for msg in reversed(conversation):
+            if msg.get("role") == "assistant" and msg.get("content"):
+                summary = _extract_order_from_text(msg["content"])
+                if summary:
+                    return True, summary
+
+    # ── Phase B: Customer message itself contains items + confirmation ─────────
+    _CUSTOMER_ORDER_PREFIXES = (
+        "yes,", "yes ", "si,", "sí,",
+        "confirm:", "order:", "i want", "i'd like",
+        "quiero", "me das", "ponme",
+    )
+    if any(customer_lower.startswith(p) for p in _CUSTOMER_ORDER_PREFIXES):
+        summary = _extract_order_from_text(customer_message)
+        if summary:
+            return True, summary
+
+    return False, ""
+
+
+# Menu item keywords used by _extract_order_from_text.
+# Extend this list to match your real menu items from the vector DB.
+_MENU_ITEM_RE = re.compile(
+    r"(\d+\s*x?\s*)?"                          # optional qty: "2x" or "2 "
+    r"("
+    r"roast chicken|chicken|pollo"
+    r"|yuca|yuca frita"
+    r"|salad|ensalada"
+    r"|salmon|salmón"
+    r"|[a-z ]{3,30}"                             # fallback: any 3-30 char word sequence
+    r")",
+    re.IGNORECASE,
+)
+
+_ITEM_STOP_WORDS = {
+    "the", "a", "an", "your", "our", "their", "its", "this", "that",
+    "my", "your", "right", "correct", "order", "like", "want", "would",
+    "you", "i", "is", "are", "was", "to", "for", "of", "with", "and",
+    "just", "confirm", "confirming", "confirmed", "please", "okay", "ok",
+    "so", "as", "in", "at", "on", "up", "no", "not", "yes", "si",
+}
+
+
+def _extract_order_from_text(text: str) -> str:
+    """
+    Extract a cleaned order summary from a sentence.
+    Looks for quantity + item patterns like "1x Roast Chicken, 2x Yuca".
+    Returns empty string if nothing recognisable is found.
+    """
+    # Prefer explicit "Nx item" patterns
+    qty_item = re.findall(r"\d+\s*x?\s+[A-Za-z][a-z ]{2,25}", text)
+    if qty_item:
+        return ", ".join(q.strip() for q in qty_item)
+
+    # Fallback: extract capitalised / known food nouns after a colon or "like"
+    after_colon = re.search(r"(?:like|order is|you'd like|you want|confirm[^:]*:)\s*(.+?)(?:\.|,|\?|$)",
+                            text, re.IGNORECASE)
+    if after_colon:
+        candidate = after_colon.group(1).strip()
+        words = [w for w in candidate.split() if w.lower() not in _ITEM_STOP_WORDS]
+        if words:
+            return " ".join(words)
+
+    return ""
+
+
 def _is_affirmative(raw: str) -> bool:
     """
     Detect a YES from natural language — handles:
@@ -746,7 +849,14 @@ async def chat_endpoint(request: ChatRequest):
             msg = call_llm(client, tenant["model_name"], session.messages)
             final_reply = msg.content or "No problem! What would you like to order?"
 
-    # ── STATE: ORDER (RAG + order_ready tool) ─────────────────────────────────
+    # ── STATE: ORDER ──────────────────────────────────────────────────────────
+    # Design decision: order_ready is NOT a tool anymore.
+    # LLaMA kept printing "<function=order_ready...>" as plain text instead of
+    # emitting a proper tool call. Server now owns the confirmation detection:
+    #   1. LLM chats freely, only uses query_vector_database for menu lookups.
+    #   2. Server inspects each LLM reply for a confirmation pattern.
+    #   3. If found → server extracts the order summary and advances FSM.
+    #   4. If not   → reply goes to customer as-is.
     elif session.status == State.ORDER:
         for iteration in range(MAX_TOOL_ITERS):
             msg = call_llm(
@@ -754,81 +864,74 @@ async def chat_endpoint(request: ChatRequest):
                 tools=TOOLS_ORDER,
             )
 
-            # No tool call → plain text reply, stay in ORDER
-            if not msg.tool_calls:
-                raw_reply  = msg.content or ""
-                final_reply = strip_hallucinations(raw_reply)
+            # ── Tool call (only query_vector_database expected here) ───────
+            if msg.tool_calls:
+                session.messages.append(msg)
 
-                if final_reply != raw_reply:
-                    logger.warning(f"[guard] Stripped hallucination on iter={iteration}: '{raw_reply[:100]}'")
+                for tc in msg.tool_calls:
+                    f_name = tc.function.name
+                    try:
+                        f_args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        f_args = {}
+                        logger.warning(f"[tool] Bad JSON args for {f_name}")
 
-                # If stripping left nothing useful, ask for a clean retry
-                if len(final_reply) < 8:
-                    nudge = call_llm(client, tenant["model_name"], session.messages)
-                    final_reply = strip_hallucinations(nudge.content or "What would you like to order?")
+                    if f_name == "query_vector_database":
+                        tool_result = query_vector_database(f_args.get("query", ""), tenant_id)
+                    else:
+                        tool_result = f"ERROR: tool '{f_name}' is not available at this stage."
+                        logger.warning(f"[tool] Unexpected tool in ORDER state: {f_name}")
 
+                    session.messages.append({
+                        "role":         "tool",
+                        "tool_call_id": tc.id,
+                        "name":         f_name,
+                        "content":      tool_result,
+                    })
+                continue  # loop back so LLM generates a text reply after tool result
+
+            # ── Plain text reply ───────────────────────────────────────────
+            raw_reply   = msg.content or ""
+            final_reply = strip_hallucinations(raw_reply)
+
+            if not final_reply or len(final_reply) < 8:
+                final_reply = "What would you like to order?"
                 break
 
-            # Process tool calls
-            session.messages.append(msg)
-            transitioned = False
+            # ── Server-side order confirmation detection ───────────────────
+            # We look for the LLM asking "just to confirm — you'd like X, right?"
+            # or the customer explicitly confirming in this same message.
+            # Strategy: if the reply contains a confirmation question AND the
+            # last customer message is affirmative, extract the order and advance.
+            order_confirmed, order_summary = _detect_order_confirmation(
+                llm_reply=final_reply,
+                customer_message=request.message,
+                conversation=session.messages,
+            )
 
-            for tc in msg.tool_calls:
-                f_name = tc.function.name
-                try:
-                    f_args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    f_args = {}
-                    logger.warning(f"[tool] Bad JSON args for {f_name}")
+            if order_confirmed and order_summary:
+                session.collected.order_summary = order_summary
+                session.checkout_field = _determine_first_checkout_field(session)
+                session.status = (
+                    State.CONFIRM if session.checkout_field == CheckoutField.DONE
+                    else State.CHECKOUT
+                )
+                logger.info(f"[order_confirmed] summary='{order_summary}' → {session.status.value}")
 
-                # ── query_vector_database ──────────────────────────────────
-                if f_name == "query_vector_database":
-                    tool_result = query_vector_database(
-                        f_args.get("query", ""), tenant_id
-                    )
-
-                # ── order_ready ────────────────────────────────────────────
-                elif f_name == "order_ready":
-                    order_sum = f_args.get("order_summary", "").strip()
-                    if not order_sum:
-                        tool_result = "ERROR: order_summary is required."
-                    else:
-                        session.collected.order_summary = order_sum
-
-                        # Determine what checkout fields are needed
-                        session.checkout_field = _determine_first_checkout_field(session)
-
-                        if session.checkout_field == CheckoutField.DONE:
-                            # All data already on file → go straight to CONFIRM
-                            session.status = State.CONFIRM
-                        else:
-                            session.status = State.CHECKOUT
-
-                        tool_result  = f"Order noted: {order_sum}. Proceeding to checkout."
-                        transitioned = True
-                        logger.info(f"[order_ready] → {session.status.value}, first_field={session.checkout_field.value}")
-
-                else:
-                    tool_result = f"ERROR: Unknown tool '{f_name}'."
-                    logger.error(f"[tool] Unknown tool called: {f_name}")
-
-                session.messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.id,
-                    "name":         f_name,
-                    "content":      tool_result,
-                })
-
-            # If order_ready was called, generate the first checkout question
-            if transitioned:
+                # Strip the confirmation question from the reply — the LLM will
+                # generate the first checkout question fresh with the new prompt.
                 _refresh_system_prompt(session, brand, raw_prompt)
+                session.messages.append({"role": "assistant", "content": final_reply})
                 msg2 = call_llm(client, tenant["model_name"], session.messages)
                 final_reply = msg2.content or ""
-                break
+                # Prevent double-append below
+                session.messages.append({"role": "assistant", "content": final_reply})
+                return _response(session, final_reply)
+
+            break  # plain reply, no confirmation → send to customer
 
         else:
-            # Exhausted MAX_TOOL_ITERS without a text reply
-            final_reply = "I'm having trouble processing your request. Could you please repeat your order?"
+            final_reply = "I'm having trouble. Could you please describe your order again?"
             logger.error("[tool_loop] Exhausted MAX_TOOL_ITERS in STATE_ORDER")
 
     # ── STATE: DONE (shouldn't normally receive messages, but handle gracefully)
