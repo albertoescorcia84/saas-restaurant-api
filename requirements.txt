@@ -1,7 +1,8 @@
 fastapi
-uvicorn
-sqlalchemy
-psycopg2-binary
+uvicorn[standard]
 groq
 python-dotenv
-pydantic
+sqlalchemy
+psycopg2-binary
+httpx
+pydantic[email]

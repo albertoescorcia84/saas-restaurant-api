@@ -1,0 +1,165 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
+  <title>{{subject}}</title>
+  <style>
+    /* Reset */
+    body, table, td, a { -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
+    table, td { mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
+    img { -ms-interpolation-mode: bicubic; border: 0; height: auto; line-height: 100%; outline: none; text-decoration: none; }
+    body { margin: 0 !important; padding: 0 !important; background-color: #f4f4f7; }
+
+    /* Main */
+    .email-wrapper { width: 100%; background-color: #f4f4f7; padding: 40px 0; }
+    .email-container { max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+
+    /* Header */
+    .email-header {
+      background: linear-gradient(135deg, #6c63ff 0%, #4f46e5 100%);
+      padding: 36px 48px;
+      text-align: center;
+    }
+    .email-header .brand-name {
+      color: #ffffff;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+      margin: 0;
+    }
+    .email-header .brand-tagline {
+      color: rgba(255,255,255,0.75);
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 13px;
+      margin: 4px 0 0 0;
+    }
+
+    /* Body */
+    .email-body { padding: 44px 48px; }
+
+    .email-title {
+      color: #111827;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 24px;
+      font-weight: 700;
+      margin: 0 0 16px 0;
+      line-height: 1.3;
+    }
+
+    .email-content {
+      color: #374151;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 16px;
+      line-height: 1.7;
+      margin: 0 0 28px 0;
+    }
+
+    /* CTA Button (optional — include in body if needed) */
+    .email-cta {
+      text-align: center;
+      margin: 32px 0;
+    }
+    .email-cta a {
+      background-color: #6c63ff;
+      color: #ffffff;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 15px;
+      font-weight: 600;
+      text-decoration: none;
+      padding: 14px 32px;
+      border-radius: 8px;
+      display: inline-block;
+    }
+
+    /* Divider */
+    .email-divider {
+      border: none;
+      border-top: 1px solid #e5e7eb;
+      margin: 32px 0;
+    }
+
+    /* Footer */
+    .email-footer {
+      background-color: #f9fafb;
+      padding: 28px 48px;
+      border-top: 1px solid #e5e7eb;
+      text-align: center;
+    }
+    .email-footer p {
+      color: #9ca3af;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 12px;
+      line-height: 1.6;
+      margin: 0;
+    }
+    .email-footer a {
+      color: #6c63ff;
+      text-decoration: none;
+    }
+
+    /* Mobile */
+    @media screen and (max-width: 600px) {
+      .email-body { padding: 32px 24px !important; }
+      .email-header { padding: 28px 24px !important; }
+      .email-footer { padding: 24px !important; }
+      .email-title { font-size: 20px !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="email-wrapper">
+    <div class="email-container">
+
+      <!-- HEADER -->
+      <div class="email-header">
+        <!--
+          To use a logo image, replace the <p> below with:
+          <img src="{{logo_url}}" alt="{{sender_name}}" width="140" style="display:block;margin:0 auto;" />
+        -->
+        <p class="brand-name">{{sender_name}}</p>
+        <p class="brand-tagline">{{sender_tagline}}</p>
+      </div>
+
+      <!-- BODY -->
+      <div class="email-body">
+        <h1 class="email-title">{{title}}</h1>
+
+        <div class="email-content">
+          {{body}}
+        </div>
+
+        <!-- Optional CTA — remove if not needed -->
+        <!--
+        <div class="email-cta">
+          <a href="{{cta_url}}">{{cta_label}}</a>
+        </div>
+        -->
+
+        <hr class="email-divider" />
+
+        <p style="color:#6b7280;font-family:Arial,Helvetica,sans-serif;font-size:14px;margin:0;">
+          If you have any questions, reply to this email or contact us at
+          <a href="mailto:{{reply_to}}" style="color:#6c63ff;text-decoration:none;">{{reply_to}}</a>.
+        </p>
+      </div>
+
+      <!-- FOOTER -->
+      <div class="email-footer">
+        <p>
+          © {{year}} {{sender_name}}. All rights reserved.<br/>
+          {{sender_address}}
+        </p>
+        <p style="margin-top:8px;">
+          You received this email because a request was made on your behalf.<br/>
+          <a href="#">Unsubscribe</a>
+        </p>
+      </div>
+
+    </div>
+  </div>
+</body>
+</html>

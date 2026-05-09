@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from groq import Groq
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+from routers.notifications import router as notifications_router
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bootstrap
@@ -53,7 +54,7 @@ engine = create_engine(
 )
 
 app = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="3.0.0")
-
+app.include_router(notifications_router)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM Constants
