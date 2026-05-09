@@ -227,76 +227,75 @@ def build_system_prompt(session: Session, brand: str, raw_prompt: str) -> str:
     c    = session.collected
 
     if session.status == State.ORDER:
+        # Returning vs new customer context — embedded in prose, no standalone directives
         if session.is_global_customer and c.full_name:
-            greeting_instruction = (
-                f"The person messaging is a returning customer named {c.full_name}. "
-                f"Start by greeting them by name."
-            )
+            customer_ctx = f"You are chatting with {c.full_name}, a returning customer. Greet them by name."
         else:
-            greeting_instruction = "Start with a friendly greeting. Do not ask for the customer's name."
+            customer_ctx = "You are chatting with a new customer."
 
         return (
             f"{base}\n\n"
-            f"{greeting_instruction} "
-            f"You are a friendly restaurant assistant helping the customer order food. "
-            f"Only talk about the menu — do not ask for delivery address, name, or email yet. "
-            f"If the customer asks about dishes, prices, or ingredients, "
-            f"use the query_vector_database tool to look it up — never guess. "
-            f"Once the customer decides what they want, confirm it back naturally, for example: "
-            f"'Perfect! So that's 1x Roast Chicken — shall I go ahead with that?' "
-            f"Wait for the customer to say yes before moving forward. "
-            f"Keep every reply short — one or two sentences maximum."
+            f"{customer_ctx} "
+            f"Your role is to help them choose what to eat from the menu and take their order. "
+            f"Use the query_vector_database tool if they ask about any dish, price, or ingredient. "
+            f"Never mention food items that were not returned by that tool. "
+            f"Do not ask for personal details such as name, address, or email at this point. "
+            f"Once the customer has told you what they want to order, "
+            f"summarize it back to them and ask them to confirm before proceeding. "
+            f"Keep each reply brief and conversational."
         )
 
     if session.status == State.CHECKOUT:
-        order = c.order_summary
+        o = c.order_summary
 
         if session.checkout_field == CheckoutField.ADDRESS:
             task = (
-                f"The customer just ordered: {order}. "
-                f"Your next message should warmly ask for their delivery address — "
-                f"nothing else. One natural sentence, like you would say it on the phone."
+                f"The customer has confirmed their order ({o}). "
+                f"Ask them for their delivery address. "
+                f"Be brief and friendly. Do not repeat the order. Do not ask for anything else."
             )
         elif session.checkout_field == CheckoutField.NAME:
             task = (
-                f"You are collecting delivery info for the order: {order}. "
+                f"You are collecting delivery details for order: {o}. "
                 f"You already have the address. "
-                f"Ask the customer for their full name in a natural, friendly way. "
-                f"One sentence only — do not ask for anything else."
+                f"Ask the customer for their full name. "
+                f"Be brief. Do not ask for anything else."
             )
         elif session.checkout_field == CheckoutField.EMAIL:
             task = (
-                f"You are almost done collecting info for the order: {order}. "
-                f"You have the name and address. "
-                f"Politely ask for their email. Make clear it's optional and they can skip it. "
-                f"One sentence only."
+                f"You are finishing up the delivery details for order: {o}. "
+                f"Ask the customer for their email address. "
+                f"Let them know it is optional and they may skip it. "
+                f"One sentence. Do not ask for anything else."
             )
         else:
-            task = "Politely ask the customer for any remaining missing information."
+            task = "Ask the customer for any remaining missing delivery information."
 
         return f"{base}\n\n{task}"
 
     if session.status == State.CONFIRM:
-        email_part = f", email {c.email}" if c.email else ""
+        email_line = f"Email: {c.email}. " if c.email else ""
         return (
             f"{base}\n\n"
-            f"You are about to confirm an order. Tell the customer in a warm, human tone:\n"
-            f"- Their name: {c.full_name}\n"
-            f"- Delivery address: {c.address}\n"
-            f"- Order: {c.order_summary}{email_part}\n\n"
-            f"After reading those back, ask something like: "
-            f"'Does everything look right?' "
-            f"Write it as natural speech — no technical labels, no bullet points in your reply. "
-            f"Do not save or call any tool yet."
+            f"Read back the order details to the customer and ask them to confirm. "
+            f"The details are: "
+            f"Name: {c.full_name}. "
+            f"Delivery address: {c.address}. "
+            f"{email_line}"
+            f"Order: {c.order_summary}. "
+            f"Speak naturally, as if on a phone call. "
+            f"Ask whether the details are correct and whether they want to proceed. "
+            f"Do not call any tool. Do not save anything yet."
         )
 
     if session.status == State.DONE:
         return (
             f"{base}\n\n"
-            f"The order is confirmed and saved. Send a short closing message to {c.full_name} "
-            f"confirming that {c.order_summary} will be delivered to {c.address}. "
-            f"You can mention reference ID {c.customer_id} if you like. "
-            f"Two sentences max. Be warm and genuine — sound like a real person, not a robot."
+            f"The order has been placed successfully. "
+            f"Write a short, warm closing message to {c.full_name}. "
+            f"Confirm their order of {c.order_summary} will be delivered to {c.address}. "
+            f"Reference number: {c.customer_id}. "
+            f"Keep it to two sentences. Be genuine and friendly."
         )
 
     return base  # fallback
