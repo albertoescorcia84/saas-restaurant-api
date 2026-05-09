@@ -919,15 +919,30 @@ async def chat_endpoint(request: ChatRequest):
                 final_reply = "What would you like to order?"
 
             if order_confirmed and order_summary:
-                # Clean the summary — remove conversational filler, keep items + prices
+                # Clean order_summary — extract only "Item $price" patterns
+                import re as _re
+                # Try to find "Nx Item $price" or "Item $price" patterns first
                 clean_summary = order_summary.strip()
-                # Strip leading filler phrases the LLM adds
-                for filler in ("you're good with ", "so just ", "that's ", "just ",
-                               "i'll confirm ", "your order is ", "so you want "):
-                    if clean_summary.lower().startswith(filler):
+                # Strip common filler phrases the LLM prepends
+                _FILLERS = (
+                    "your total comes out to be ", "you've ordered ", "you ordered ",
+                    "you're good with the ", "you're good with ",
+                    "so just the ", "so just ", "that's ", "just the ", "just ",
+                    "i'll confirm ", "your order is ", "so you want ", "you want ",
+                    "you'd like ", "i have ", "we have ",
+                )
+                lower = clean_summary.lower()
+                for filler in _FILLERS:
+                    if lower.startswith(filler):
                         clean_summary = clean_summary[len(filler):]
+                        lower = clean_summary.lower()
                         break
-                session.collected.order_summary = clean_summary.strip().rstrip(".")
+                # Strip trailing filler
+                for suffix in (", no side", ", no sides", " for delivery", " for you"):
+                    if clean_summary.lower().endswith(suffix):
+                        clean_summary = clean_summary[:-len(suffix)]
+                        break
+                session.collected.order_summary = clean_summary.strip().rstrip(".,")
                 session.checkout_field = _determine_first_checkout_field(session)
                 session.status = (
                     State.CONFIRM if session.checkout_field == CheckoutField.DONE
