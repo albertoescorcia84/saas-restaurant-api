@@ -810,17 +810,16 @@ async def chat_endpoint(request: ChatRequest):
                 f"Does everything look correct?"
             )
         else:
-            # Still in CHECKOUT — LLM asks for next field
-            _FALLBACKS = {
-                CheckoutField.ADDRESS: "Great! And what's your delivery address?",
-                CheckoutField.NAME:    "Got it! Could I get your full name?",
-                CheckoutField.EMAIL:   "Almost done! What's your email? You can skip this if you prefer.",
+            # Still in CHECKOUT — hardcoded questions, no LLM (prevents improvisation)
+            _QUESTIONS = {
+                CheckoutField.ADDRESS: "Got it! What's your delivery address?",
+                CheckoutField.NAME:    "Perfect! And your full name for the order?",
+                CheckoutField.EMAIL:   "Almost done! What's your email address? Feel free to skip if you prefer.",
             }
-            _refresh_system_prompt(session, brand, raw_prompt, menu_text)
-            msg = call_llm(client, tenant["model_name"], session.messages)
-            final_reply = (msg.content or "").strip()
-            if not final_reply:
-                final_reply = _FALLBACKS.get(session.checkout_field, "Could you provide the missing information?")
+            final_reply = _QUESTIONS.get(
+                session.checkout_field,
+                "Could you provide the remaining delivery information?"
+            )
 
     # ── STATE: CONFIRM (explicit YES / NO detection) ──────────────────────────
     # The server generates the confirmation message directly — no LLM.
@@ -864,49 +863,19 @@ async def chat_endpoint(request: ChatRequest):
                 resp["_db_error"] = str(db_err)  # visible in response for debugging
                 return resp
 
-            # Generate closing message with LLM
-            _refresh_system_prompt(session, brand, raw_prompt, menu_text)
-            # Add a tool result message so the LLM understands the save succeeded
-            session.messages.append({
-                "role":    "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id":   "direct_save_001",
-                    "type": "function",
-                    "function": {
-                        "name":      "manage_customer_data",
-                        "arguments": json.dumps({
-                            "full_name":     c.full_name,
-                            "address":       c.address,
-                            "email":         c.email,
-                            "order_summary": c.order_summary,
-                        })
-                    }
-                }]
-            })
-            session.messages.append({
-                "role":         "tool",
-                "tool_call_id": "direct_save_001",
-                "name":         "manage_customer_data",
-                "content":      f"SUCCESS. customer_id={customer_id}. Order saved.",
-            })
-
-            msg = call_llm(client, tenant["model_name"], session.messages)
-            final_reply = msg.content or (
-                f"Thank you {c.full_name}! Your order ({c.order_summary}) "
-                f"has been confirmed and will be delivered to {c.address}. "
-                f"Your reference ID is {customer_id}. Enjoy your meal!"
+            # Hardcoded closing — never use LLM here to prevent premature completion
+            final_reply = (
+                f"You're all set, {c.full_name}! Your order of {c.order_summary} "
+                f"will be delivered to {c.address}. "
+                f"Your reference number is {customer_id}. Thank you and enjoy your meal!"
             )
 
         else:
-            # Customer said NO — restart from order taking
+            # Customer said NO — restart order, keep address if we had one
             session.status         = State.ORDER
             session.checkout_field = CheckoutField.ADDRESS
             session.collected.order_summary = ""
-            session.collected.address       = session.collected.address  # keep known address
-            _refresh_system_prompt(session, brand, raw_prompt, menu_text)
-            msg = call_llm(client, tenant["model_name"], session.messages)
-            final_reply = msg.content or "No problem! What would you like to order?"
+            final_reply = "No problem at all! What would you like to order?"
 
     # ── STATE: ORDER ──────────────────────────────────────────────────────────
     elif session.status == State.ORDER:
