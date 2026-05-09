@@ -220,7 +220,7 @@ def _clean_base_prompt(raw: str, brand: str) -> str:
     return cleaned
 
 
-def build_system_prompt(session: Session, brand: str, raw_prompt: str) -> str:
+def build_system_prompt(session: Session, brand: str, raw_prompt: str, menu_text: str = "") -> str:
     """
     Build a conversational, state-specific system prompt.
 
@@ -237,20 +237,22 @@ def build_system_prompt(session: Session, brand: str, raw_prompt: str) -> str:
         else:
             customer_ctx = "You are chatting with a new customer."
 
+        menu_section = f"\n\nMENU:\n{menu_text}" if menu_text else ""
+
         return (
-            f"{base}\n\n"
+            f"{base}"
+            f"{menu_section}\n\n"
             f"{customer_ctx} "
-            f"Take their food order. Be direct — like a real waiter, not a chatbot. "
-            f"If the customer names a dish, immediately repeat it back and ask if that is correct. "
-            f"Do not offer extra information, alternatives, or suggestions unless explicitly asked. "
-            f"Only use the query_vector_database tool when the customer asks about a dish, "
-            f"price, or ingredient. "
+            f"You are a friendly and natural restaurant assistant — speak like a real person, not a robot. "
+            f"Help the customer order from the menu above. "
+            f"If the customer greets you, greet them back warmly and ask what they would like. "
+            f"If they name a dish, confirm it and suggest a side dish from the menu if they have not picked one. "
+            f"If they decline the side, accept it gracefully and confirm the final order. "
+            f"Keep replies short — two sentences maximum. "
             f"Do not ask for name, address, or email. "
-            f"When the customer confirms their order with yes or similar, "
-            f"write ORDER_CONFIRMED: followed by a short list of the confirmed items, "
-            f"then tell them you will collect their delivery details next. "
-            f"The ORDER_CONFIRMED: tag must appear in your reply when the order is confirmed — "
-            f"it is read by the system to advance the conversation."
+            f"Once the customer confirms everything they want, write ORDER_CONFIRMED: followed by "
+            f"a short summary of all confirmed items, then say you will collect their delivery info. "
+            f"The ORDER_CONFIRMED: tag is required — the system uses it to move to the next step."
         )
 
     if session.status == State.CHECKOUT:
@@ -432,24 +434,33 @@ def db_save_customer(
 
 def query_vector_database(query: str, tenant_id: str) -> str:
     """
-    Replace this stub with your actual vector similarity search.
-    Example using pgvector:
-        embedding = embed(query)
-        rows = conn.execute("SELECT item, price FROM menu_vectors
-                             WHERE tenant_id=:tid
-                             ORDER BY embedding <-> :emb LIMIT 5", ...)
-        return format_results(rows)
+    Fetch menu content from menu_vectors table for the given tenant.
+    Since embeddings are NULL, we do a simple full-text fetch of all
+    content rows for this tenant and return them directly.
     """
     logger.info(f"[vector_db] tenant={tenant_id} query='{query}'")
-    # ── STUB — replace below ──────────────────────────────────────────────────
-    return (
-        "MENU RESULTS:\n"
-        "- Roast Chicken: $20.00 (gluten-free, served with rice)\n"
-        "- Yuca Frita: $4.00\n"
-        "- Garden Salad: $3.00 (vegan)\n"
-        "- Grilled Salmon: $24.00\n"
-        "Source: menu vector index."
-    )
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT content FROM menu_vectors
+                WHERE tenant_id = :tid
+                ORDER BY id
+            """), {"tid": tenant_id}).fetchall()
+
+        if not rows:
+            logger.warning(f"[vector_db] No menu found for tenant_id={tenant_id}")
+            return "Menu information is not available."
+
+        return "\n".join(r[0] for r in rows)
+
+    except Exception as e:
+        logger.error(f"[vector_db] DB error: {e}")
+        return "Menu information could not be retrieved."
+
+
+def get_full_menu(tenant_id: str) -> str:
+    """Fetch the complete menu text for a tenant — used to inject into system prompt."""
+    return query_vector_database("full menu", tenant_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -594,9 +605,9 @@ def _extract_name(raw: str) -> str:
 # Session helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _refresh_system_prompt(session: Session, brand: str, raw_prompt: str) -> None:
+def _refresh_system_prompt(session: Session, brand: str, raw_prompt: str, menu_text: str = "") -> None:
     """Replace (or insert) the system message at index 0 of the message list."""
-    sp = {"role": "system", "content": build_system_prompt(session, brand, raw_prompt)}
+    sp = {"role": "system", "content": build_system_prompt(session, brand, raw_prompt, menu_text)}
     if session.messages and session.messages[0]["role"] == "system":
         session.messages[0] = sp
     else:
@@ -652,6 +663,10 @@ async def chat_endpoint(request: ChatRequest):
     raw_prompt = tenant["system_prompt"]
     client     = Groq(api_key=tenant["api_key"])
 
+    # Fetch menu once per request — injected into every system prompt
+    menu_text = get_full_menu(tenant_id)
+    logger.info(f"[menu] tenant={tenant_id} chars={len(menu_text)}")
+
     # ── 2. Resolve / init session ─────────────────────────────────────────────
     session = _sessions.get(user_phone)
 
@@ -693,7 +708,7 @@ async def chat_endpoint(request: ChatRequest):
         logger.info(f"[session] New session {session.session_id} for {user_phone}")
 
     # ── 3. Refresh system prompt and append user message ─────────────────────
-    _refresh_system_prompt(session, brand, raw_prompt)
+    _refresh_system_prompt(session, brand, raw_prompt, menu_text)
 
     # Trim history to last 20 messages (10 exchanges) to prevent role drift.
     # Always keep index 0 (system prompt).
@@ -730,10 +745,33 @@ async def chat_endpoint(request: ChatRequest):
         else:
             session.checkout_field = next_field
 
-        # LLM generates the next question (or the confirmation summary)
-        _refresh_system_prompt(session, brand, raw_prompt)
+        # LLM generates the next question — with hardcoded fallback per field
+        _refresh_system_prompt(session, brand, raw_prompt, menu_text)
         msg = call_llm(client, tenant["model_name"], session.messages)
-        final_reply = msg.content or ""
+        final_reply = (msg.content or "").strip()
+
+        # Fallback: if LLM returns empty, use a simple direct question
+        if not final_reply:
+            _FALLBACKS = {
+                CheckoutField.ADDRESS: "What is your delivery address?",
+                CheckoutField.NAME:    "What is your full name?",
+                CheckoutField.EMAIL:   "What is your email address? (optional — you can skip this)",
+            }
+            # Use the CURRENT state's field (after advancing)
+            current_field = (
+                session.checkout_field
+                if session.status == State.CHECKOUT
+                else CheckoutField.ADDRESS
+            )
+            final_reply = _FALLBACKS.get(current_field, "Could you provide the missing information?")
+
+            if session.status == State.CONFIRM:
+                c = session.collected
+                final_reply = (
+                    f"Just to confirm your order: {c.order_summary}, "
+                    f"delivering to {c.address} for {c.full_name}. "
+                    f"Is everything correct?"
+                )
 
     # ── STATE: CONFIRM (explicit YES / NO detection) ──────────────────────────
     elif session.status == State.CONFIRM:
@@ -770,7 +808,7 @@ async def chat_endpoint(request: ChatRequest):
                 return _response(session, final_reply)
 
             # Generate closing message with LLM
-            _refresh_system_prompt(session, brand, raw_prompt)
+            _refresh_system_prompt(session, brand, raw_prompt, menu_text)
             # Add a tool result message so the LLM understands the save succeeded
             session.messages.append({
                 "role":    "assistant",
@@ -809,7 +847,7 @@ async def chat_endpoint(request: ChatRequest):
             session.checkout_field = CheckoutField.ADDRESS
             session.collected.order_summary = ""
             session.collected.address       = session.collected.address  # keep known address
-            _refresh_system_prompt(session, brand, raw_prompt)
+            _refresh_system_prompt(session, brand, raw_prompt, menu_text)
             msg = call_llm(client, tenant["model_name"], session.messages)
             final_reply = msg.content or "No problem! What would you like to order?"
 
@@ -858,10 +896,23 @@ async def chat_endpoint(request: ChatRequest):
                     else State.CHECKOUT
                 )
                 logger.info(f"[order] confirmed='{order_summary}' next={session.status.value}")
-                _refresh_system_prompt(session, brand, raw_prompt)
+                _refresh_system_prompt(session, brand, raw_prompt, menu_text)
                 session.messages.append({"role": "assistant", "content": final_reply})
                 msg2 = call_llm(client, tenant["model_name"], session.messages)
-                final_reply = msg2.content or ""
+                final_reply = (msg2.content or "").strip()
+
+                # Hardcoded fallback — LLM sometimes returns empty on state transition
+                if not final_reply:
+                    _FIELD_Q = {
+                        CheckoutField.ADDRESS: "What is your delivery address?",
+                        CheckoutField.NAME:    "What is your full name?",
+                        CheckoutField.EMAIL:   "What is your email? (optional, you can skip)",
+                    }
+                    final_reply = _FIELD_Q.get(
+                        session.checkout_field,
+                        "Could you please provide your delivery address?"
+                    )
+
                 session.messages.append({"role": "assistant", "content": final_reply})
                 return _response(session, final_reply)
 
