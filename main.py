@@ -218,66 +218,80 @@ def _clean_base_prompt(raw: str, brand: str) -> str:
 
 
 def build_system_prompt(session: Session, brand: str, raw_prompt: str) -> str:
-    """Return a tight, state-specific system prompt. One job per state."""
+    """
+    Build a conversational, state-specific system prompt.
+
+    Golden rule: never use uppercase headers like "CURRENT TASK —" or numbered
+    lists in the instructions — LLaMA 3 leaks them verbatim into the reply.
+    Write instructions as if privately coaching a human support agent.
+    """
     base = _clean_base_prompt(raw_prompt, brand)
     c    = session.collected
 
     if session.status == State.ORDER:
         customer_line = (
-            f"Returning customer: {c.full_name}. Greet them by name."
+            f"The customer's name is {c.full_name} — greet them warmly by name in your first message."
             if session.is_global_customer and c.full_name
-            else "New customer. Do NOT ask for name, email, or address yet."
+            else "You don't know the customer's name yet. Don't ask for it now."
         )
-        return f"""{base}
-
-{customer_line}
-
-CURRENT TASK — TAKE THE FOOD ORDER:
-1. Help the customer browse the menu. Use query_vector_database for any menu question.
-2. Never invent or assume menu items. Only use data returned by the tool.
-3. Once the customer confirms what they want, call order_ready(order_summary=...).
-4. Do NOT ask for personal data. Do NOT write any markers or tags.
-5. One message at a time. Be concise and friendly."""
+        return (
+            f"{base}\n\n"
+            f"{customer_line}\n\n"
+            f"You are a friendly order-taking assistant. Your only job right now is to help "
+            f"the customer decide what to eat. Use the query_vector_database tool whenever "
+            f"they ask about dishes, prices, or ingredients — never make up menu items. "
+            f"Once the customer tells you exactly what they want and confirms it, call the "
+            f"order_ready tool with a short summary of the items. "
+            f"Do not ask for their name, address, or email at this stage. "
+            f"Keep your replies short and friendly — one topic at a time."
+        )
 
     if session.status == State.CHECKOUT:
-        field_map = {
-            CheckoutField.ADDRESS: "delivery address",
-            CheckoutField.NAME:    "full name",
-            CheckoutField.EMAIL:   "email address (optional — tell them they can skip)",
+        questions = {
+            CheckoutField.ADDRESS: (
+                f"The customer just confirmed their order. "
+                f"Now you need their delivery address. "
+                f"Ask for it in a warm, natural way — one short sentence only. "
+                f"Do not mention the order again. Do not ask for anything else."
+            ),
+            CheckoutField.NAME: (
+                f"You have the customer's address. Now you need their full name for the order. "
+                f"Ask for it naturally in one short sentence. Nothing else."
+            ),
+            CheckoutField.EMAIL: (
+                f"Almost done! You just need the customer's email address. "
+                f"Let them know it's optional — they can skip it if they prefer. "
+                f"One sentence only."
+            ),
         }
-        field_label = field_map.get(session.checkout_field, "missing information")
-        return f"""{base}
-
-The customer's confirmed order: {c.order_summary}
-
-CURRENT TASK — ASK FOR {field_label.upper()}:
-Ask the customer only for their {field_label}. One sentence. Nothing else.
-Do not ask for any other information. Do not repeat the order."""
+        instruction = questions.get(session.checkout_field, "Ask for the missing information politely.")
+        return f"{base}\n\n{instruction}"
 
     if session.status == State.CONFIRM:
-        email_line = f"\n  Email: {c.email}" if c.email else ""
-        return f"""{base}
-
-CURRENT TASK — PRESENT CONFIRMATION SUMMARY:
-Present the following details clearly and ask the customer to reply YES or NO.
-
-  Customer: {c.full_name}
-  Delivery address: {c.address}{email_line}
-  Order: {c.order_summary}
-
-End your message with exactly: "Is everything correct? Reply YES to confirm or NO to make changes."
-Do NOT call any tool. Do NOT save anything. Just present and ask."""
+        email_line = f"\n- Email: {c.email}" if c.email else ""
+        return (
+            f"{base}\n\n"
+            f"You have all the information. Read the order details back to the customer "
+            f"in a warm, conversational tone — as if you were a real person confirming over the phone. "
+            f"Include their name ({c.full_name}), delivery address ({c.address}), "
+            f"and order ({c.order_summary}).{(' Their email: ' + c.email + '.') if c.email else ''} "
+            f"After presenting the details, ask if everything is correct. "
+            f"Write naturally — no bullet points, no headers. "
+            f"Do not call any tool. Do not save anything yet."
+        )
 
     if session.status == State.DONE:
-        return f"""{base}
-
-CURRENT TASK — CLOSE THE ORDER:
-The order was saved successfully.
-Thank {c.full_name} warmly. Confirm that {c.order_summary} will be delivered to {c.address}.
-Reference their customer ID: {c.customer_id}.
-Two sentences maximum. Be warm and professional."""
+        return (
+            f"{base}\n\n"
+            f"The order has been saved. Write a warm, human closing message for {c.full_name}. "
+            f"Confirm their order ({c.order_summary}) will be delivered to {c.address}. "
+            f"Optionally mention their reference ID: {c.customer_id}. "
+            f"Keep it to two sentences. Sound enthusiastic and genuine."
+        )
 
     return base  # fallback
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -468,6 +482,69 @@ def strip_hallucinations(text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Input parsers — extract clean values from natural-language customer replies
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+_SKIP_EMAIL = {"no", "skip", "none", "n/a", "-", "sin email", "no tengo",
+               "no email", "no tengo email", "omitir", "saltar"}
+
+def _extract_email(raw: str) -> str:
+    """
+    Extract a valid email from a free-text reply like:
+      "yes, it is romel123@gmail.com"   → "romel123@gmail.com"
+      "my email is foo@bar.com"         → "foo@bar.com"
+      "no" / "skip"                     → ""  (treated as skipped)
+    """
+    stripped = raw.strip()
+    if stripped.lower() in _SKIP_EMAIL:
+        return ""
+    match = _EMAIL_RE.search(stripped)
+    return match.group(0) if match else ""
+
+
+def _is_affirmative(raw: str) -> bool:
+    """
+    Detect a YES from natural language — handles:
+      "yes", "si", "correct", "that's right", "yep, go ahead", etc.
+    Returns False for anything that doesn't clearly signal agreement.
+    """
+    lowered = raw.strip().lower()
+    # Exact single-word matches
+    _YES_WORDS = {"yes", "si", "sí", "yep", "yeah", "correct", "ok", "okay",
+                  "sure", "confirm", "confirmed", "adelante", "procede",
+                  "dale", "claro", "yup", "affirmative", "perfecto", "listo"}
+    if lowered in _YES_WORDS:
+        return True
+    # Phrase-level: starts with or contains a YES word
+    _YES_PHRASES = ("yes,", "yes.", "yes!", "si,", "si.", "sí,",
+                    "that's correct", "that is correct", "looks good",
+                    "all good", "go ahead", "proceed", "everything is correct",
+                    "todo bien", "todo correcto", "está bien", "esta bien")
+    for phrase in _YES_PHRASES:
+        if phrase in lowered:
+            return True
+    return False
+
+
+def _extract_name(raw: str) -> str:
+    """
+    Strip common prefixes from name replies like:
+      "my name is John Doe"  → "John Doe"
+      "I'm Maria Lopez"      → "Maria Lopez"
+      "John Doe"             → "John Doe"
+    """
+    stripped = raw.strip()
+    for prefix in ("my name is ", "i am ", "i'm ", "soy ", "me llamo ",
+                   "mi nombre es ", "it's ", "its "):
+        lower = stripped.lower()
+        if lower.startswith(prefix):
+            stripped = stripped[len(prefix):]
+            break
+    return stripped.strip().title()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Session helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -573,12 +650,10 @@ async def chat_endpoint(request: ChatRequest):
             session.collected.address = user_input
 
         elif field == CheckoutField.NAME:
-            session.collected.full_name = user_input
+            session.collected.full_name = _extract_name(user_input)
 
         elif field == CheckoutField.EMAIL:
-            _SKIP = {"no", "skip", "none", "n/a", "-", "sin email", "no tengo"}
-            if user_input.lower() not in _SKIP:
-                session.collected.email = user_input
+            session.collected.email = _extract_email(user_input)
 
         # Advance to next missing field (or go to CONFIRM)
         next_field = _next_checkout_field(session)
@@ -595,9 +670,7 @@ async def chat_endpoint(request: ChatRequest):
 
     # ── STATE: CONFIRM (explicit YES / NO detection) ──────────────────────────
     elif session.status == State.CONFIRM:
-        _YES = {"yes","si","sí","yep","yeah","correct","ok","okay",
-                "sure","confirm","confirmed","adelante","procede","dale","claro","yup"}
-        confirmed = request.message.strip().lower() in _YES
+        confirmed = _is_affirmative(request.message)
 
         if confirmed:
             # ── Go straight to DB save — do NOT trust the LLM to call the tool
