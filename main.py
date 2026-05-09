@@ -243,16 +243,14 @@ def build_system_prompt(session: Session, brand: str, raw_prompt: str, menu_text
             f"{base}"
             f"{menu_section}\n\n"
             f"{customer_ctx} "
-            f"You are a friendly and natural restaurant assistant — speak like a real person, not a robot. "
-            f"Help the customer order from the menu above. "
-            f"If the customer greets you, greet them back warmly and ask what they would like. "
-            f"If they name a dish, confirm it and suggest a side dish from the menu if they have not picked one. "
-            f"If they decline the side, accept it gracefully and confirm the final order. "
-            f"Keep replies short — two sentences maximum. "
-            f"Do not ask for name, address, or email. "
-            f"Once the customer confirms everything they want, write ORDER_CONFIRMED: followed by "
-            f"a short summary of all confirmed items, then say you will collect their delivery info. "
-            f"The ORDER_CONFIRMED: tag is required — the system uses it to move to the next step."
+            f"You are a warm, human restaurant assistant taking a phone order. "
+            f"Speak naturally and conversationally — short sentences, friendly tone. "
+            f"When the customer says what they want, repeat it back clearly with the price "
+            f"and ask if they also want a side dish. "
+            f"If they decline the side, acknowledge it warmly and read back their complete order "
+            f"with the total, then ask them to confirm. "
+            f"Once they say yes or confirm, tell them great and that you will now get their delivery details. "
+            f"Do not ask for name, address, or email at this stage."
         )
 
     if session.status == State.CHECKOUT:
@@ -274,36 +272,32 @@ def build_system_prompt(session: Session, brand: str, raw_prompt: str, menu_text
         return (
             f"{base}\n\n"
             f"The food order is confirmed: {o}. "
-            f"You are now collecting delivery information. "
+            f"You are now collecting delivery information by phone. "
             f"{extra}"
-            f"Your only job in this message is to ask the customer for their {next_ask}. "
-            f"Do not add commentary, repeat the order, or ask for anything else. "
-            f"Keep it to one short, friendly sentence."
+            f"Ask the customer for their {next_ask} in a natural, conversational way. "
+            f"One sentence only. Sound like a real person on the phone."
         )
 
     if session.status == State.CONFIRM:
         email_line = f"Email: {c.email}. " if c.email else ""
         return (
             f"{base}\n\n"
-            f"Read back the order details to the customer and ask them to confirm. "
-            f"The details are: "
-            f"Name: {c.full_name}. "
-            f"Delivery address: {c.address}. "
-            f"{email_line}"
-            f"Order: {c.order_summary}. "
-            f"Speak naturally, as if on a phone call. "
-            f"Ask whether the details are correct and whether they want to proceed. "
-            f"Do not call any tool. Do not save anything yet."
+            f"You are confirming an order over the phone. Read these details back naturally:\n"
+            f"Name: {c.full_name}\n"
+            f"Address: {c.address}\n"
+            f"Order: {c.order_summary}\n"
+            f"{email_line}\n"
+            f"Sound warm and human. Ask if everything is correct. "
+            f"Do not call any tool or save anything yet."
         )
 
     if session.status == State.DONE:
         return (
             f"{base}\n\n"
-            f"The order has been placed successfully. "
-            f"Write a short, warm closing message to {c.full_name}. "
-            f"Confirm their order of {c.order_summary} will be delivered to {c.address}. "
-            f"Reference number: {c.customer_id}. "
-            f"Keep it to two sentences. Be genuine and friendly."
+            f"The order is placed. Thank {c.full_name} warmly. "
+            f"Confirm {c.order_summary} will be delivered to {c.address}. "
+            f"Give them reference number {c.customer_id}. "
+            f"Two sentences max. Sound like a real person wrapping up a phone call."
         )
 
     return base  # fallback
@@ -533,27 +527,80 @@ def _extract_email(raw: str) -> str:
     return match.group(0) if match else ""
 
 
-# ── Order confirmed signal ────────────────────────────────────────────────────
-# The LLM is instructed to include "ORDER_CONFIRMED:" followed by the items
-# when the customer says yes. The server detects this exact tag — no fuzzy matching.
-_ORDER_CONFIRMED_RE = re.compile(r"ORDER_CONFIRMED:\s*(.+?)(?:\.|$)", re.IGNORECASE)
+# ── Order confirmation detection ─────────────────────────────────────────────
+# Strategy: the SERVER detects when the customer has confirmed.
+# We do NOT rely on the LLM emitting a tag — that was unreliable.
+#
+# Detection works in two passes:
+#   Pass A: LLM reply contains a summary + customer says YES → extract from LLM reply
+#   Pass B: No tag needed — if customer is affirmative AND the conversation
+#           has a pending order summary in the last assistant message, use that
+
+_ORDER_CONFIRMED_RE = re.compile(r"ORDER_CONFIRMED:\s*([^\n.]+)", re.IGNORECASE)
+
+# Phrases the LLM uses when it has summarized the order and is asking to confirm
+_LLM_SUMMARY_TRIGGERS = (
+    "just the ", "so that", "your order", "i'll confirm", "confirming",
+    "shall i place", "ready to place", "to confirm", "so you",
+)
+
+def _extract_order_summary_from_llm(text: str) -> str:
+    """
+    Extract what the LLM said the order was.
+    Looks for sentences containing price markers or known item patterns.
+    """
+    # Try ORDER_CONFIRMED tag first
+    m = _ORDER_CONFIRMED_RE.search(text)
+    if m:
+        return m.group(1).strip()
+
+    # Find sentence with $ price — most likely the order summary sentence
+    for sentence in re.split(r"[.!?]", text):
+        if "$" in sentence and len(sentence.strip()) > 5:
+            # Clean it up
+            clean = re.sub(r"(so |just |that's |I'll confirm |your order is )", "", sentence, flags=re.IGNORECASE)
+            return clean.strip().strip(",").strip()
+
+    return ""
 
 
-def _detect_order_confirmation(llm_reply: str) -> tuple[bool, str]:
+def _detect_order_confirmation(llm_reply: str, customer_msg: str = "", conversation: list = []) -> tuple[bool, str]:
     """
-    Detect ORDER_CONFIRMED:<items> tag in the LLM reply.
-    Must be called on the RAW reply BEFORE strip_hallucinations runs.
+    Returns (confirmed, order_summary).
+
+    Confirmed when:
+      - LLM reply contains ORDER_CONFIRMED: tag, OR
+      - Customer message is affirmative AND the LLM reply summarizes the order
+        (contains a price or trigger phrase), OR
+      - Customer message is affirmative AND last assistant message had a summary
     """
-    match = _ORDER_CONFIRMED_RE.search(llm_reply)
-    if match:
-        summary = match.group(1).strip()
-        if summary and len(summary) > 2:
+    # Pass A: tag in LLM reply
+    m = _ORDER_CONFIRMED_RE.search(llm_reply)
+    if m:
+        summary = m.group(1).strip()
+        if summary and len(summary) > 3:
             return True, summary
+
+    # Pass B: customer said yes + LLM reply summarizes the order
+    if customer_msg and _is_affirmative(customer_msg):
+        summary = _extract_order_summary_from_llm(llm_reply)
+        if summary:
+            return True, summary
+
+        # Pass C: look at the previous assistant message for a summary
+        for msg in reversed(conversation):
+            if msg.get("role") == "assistant" and msg.get("content"):
+                prev_summary = _extract_order_summary_from_llm(msg["content"])
+                if prev_summary:
+                    return True, prev_summary
+                # Stop after checking the most recent assistant message
+                break
+
     return False, ""
 
 
 def _extract_order_from_text(text: str) -> str:
-    """Legacy helper — kept for potential future use."""
+    """Legacy — kept for compatibility."""
     qty_item = re.findall(r"\d+\s*x?\s+[A-Za-z][a-z ]{2,25}", text)
     if qty_item:
         return ", ".join(q.strip() for q in qty_item)
@@ -880,8 +927,12 @@ async def chat_endpoint(request: ChatRequest):
             # ── Plain text reply ───────────────────────────────────────────
             raw_reply = msg.content or ""
 
-            # IMPORTANT: detect ORDER_CONFIRMED BEFORE stripping it
-            order_confirmed, order_summary = _detect_order_confirmation(raw_reply)
+            # Detect BEFORE stripping — pass customer message and history for Pass B/C
+            order_confirmed, order_summary = _detect_order_confirmation(
+                llm_reply=raw_reply,
+                customer_msg=request.message,
+                conversation=session.messages,
+            )
 
             # Now strip internal tags from the customer-facing reply
             final_reply = strip_hallucinations(raw_reply)
