@@ -195,22 +195,27 @@ _LEGACY_RE = re.compile(
 def _clean_base_prompt(raw: str, brand: str) -> str:
     """
     Sanitize and format the DB-stored base prompt.
-    Uses safe_substitute-style approach: only fills known keys,
-    ignores unknown {placeholders} that may exist in the raw prompt.
-    Falls back to a minimal default if the prompt is empty or broken.
+
+    Removes legacy directives, fills {restaurant_name}, and strips
+    {menu_context} entirely (menu data comes from query_vector_database,
+    not from an inline placeholder).
+
+    Falls back to a safe minimal prompt if the DB value is empty or broken.
     """
     cleaned = _LEGACY_RE.sub("", raw).strip()
 
-    # Replace only the known placeholders — don't crash on unknown ones
     try:
         cleaned = cleaned.replace("{restaurant_name}", brand)
-        cleaned = cleaned.replace("{menu_context}", "our menu")
+        cleaned = cleaned.replace("{menu_context}", "")
+        cleaned = re.sub(r"Menu Context:[^\n]*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\d+\.\s*(CRITICAL|ORDER FLOW|STRICT)[^\n]*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.strip()
     except Exception:
         pass
 
-    if not cleaned or len(cleaned) < 10:
-        # Minimal safe fallback if DB prompt is empty or completely stripped
-        cleaned = f"You are a helpful ordering assistant for {brand}."
+    # Hard minimum — if after all cleaning we have less than 20 chars, use fallback
+    if not cleaned or len(cleaned) < 20:
+        cleaned = f"You are a professional ordering assistant for {brand}."
 
     return cleaned
 
@@ -523,17 +528,10 @@ def _extract_email(raw: str) -> str:
 _ORDER_CONFIRMED_RE = re.compile(r"ORDER_CONFIRMED:\s*(.+?)(?:\.|$)", re.IGNORECASE)
 
 
-def _detect_order_confirmation(
-    llm_reply: str,
-    customer_message: str,
-    conversation: list,
-) -> tuple[bool, str]:
+def _detect_order_confirmation(llm_reply: str) -> tuple[bool, str]:
     """
-    Detect order confirmation via a strict server-readable tag.
-
-    The LLM is instructed to write "ORDER_CONFIRMED: <items>" when the
-    customer confirms. The server looks for this tag — nothing else.
-    This eliminates all fuzzy matching that was causing false positives.
+    Detect ORDER_CONFIRMED:<items> tag in the LLM reply.
+    Must be called on the RAW reply BEFORE strip_hallucinations runs.
     """
     match = _ORDER_CONFIRMED_RE.search(llm_reply)
     if match:
@@ -657,15 +655,29 @@ async def chat_endpoint(request: ChatRequest):
     # ── 2. Resolve / init session ─────────────────────────────────────────────
     session = _sessions.get(user_phone)
 
-    if not session or session.status == State.DONE:
-        # Fresh session — query the DB for customer context
+    # Force a fresh session if:
+    #  - no session exists
+    #  - previous session is completed
+    #  - session belongs to a different tenant (customer moved to another restaurant)
+    _GREETINGS = {"hello","hi","hola","hey","buenos dias","buenas","good morning",
+                  "good afternoon","good evening","start","restart","nuevo","nueva"}
+    is_greeting = request.message.strip().lower() in _GREETINGS
+
+    need_new_session = (
+        not session
+        or session.status == State.DONE
+        or session.tenant_id != tenant_id
+        or is_greeting   # always start fresh on a greeting
+    )
+
+    if need_new_session:
         cust = db_get_customer(user_phone, tenant_id)
 
         collected = CustomerData(
-            full_name     = cust["full_name"],
-            email         = cust["email"],
-            address       = cust["address_line_1"],   # pre-fill if known
-            customer_id   = cust["customer_id"],
+            full_name   = cust["full_name"],
+            email       = cust["email"],
+            address     = cust["address_line_1"],
+            customer_id = cust["customer_id"],
         )
 
         session = Session(
@@ -678,9 +690,16 @@ async def chat_endpoint(request: ChatRequest):
             had_address        = bool(cust["address_line_1"]),
         )
         _sessions[user_phone] = session
+        logger.info(f"[session] New session {session.session_id} for {user_phone}")
 
-    # ── 3. Append user message + refresh system prompt ────────────────────────
+    # ── 3. Refresh system prompt and append user message ─────────────────────
     _refresh_system_prompt(session, brand, raw_prompt)
+
+    # Trim history to last 20 messages (10 exchanges) to prevent role drift.
+    # Always keep index 0 (system prompt).
+    if len(session.messages) > 21:
+        session.messages = [session.messages[0]] + session.messages[-20:]
+
     session.messages.append({"role": "user", "content": request.message})
     final_reply = ""
 
@@ -795,13 +814,6 @@ async def chat_endpoint(request: ChatRequest):
             final_reply = msg.content or "No problem! What would you like to order?"
 
     # ── STATE: ORDER ──────────────────────────────────────────────────────────
-    # Design decision: order_ready is NOT a tool anymore.
-    # LLaMA kept printing "<function=order_ready...>" as plain text instead of
-    # emitting a proper tool call. Server now owns the confirmation detection:
-    #   1. LLM chats freely, only uses query_vector_database for menu lookups.
-    #   2. Server inspects each LLM reply for a confirmation pattern.
-    #   3. If found → server extracts the order summary and advances FSM.
-    #   4. If not   → reply goes to customer as-is.
     elif session.status == State.ORDER:
         for iteration in range(MAX_TOOL_ITERS):
             msg = call_llm(
@@ -809,50 +821,34 @@ async def chat_endpoint(request: ChatRequest):
                 tools=TOOLS_ORDER,
             )
 
-            # ── Tool call (only query_vector_database expected here) ───────
+            # ── Tool call → execute and loop back for text reply ──────────
             if msg.tool_calls:
                 session.messages.append(msg)
-
                 for tc in msg.tool_calls:
-                    f_name = tc.function.name
                     try:
                         f_args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
                         f_args = {}
-                        logger.warning(f"[tool] Bad JSON args for {f_name}")
-
-                    if f_name == "query_vector_database":
+                    if tc.function.name == "query_vector_database":
                         tool_result = query_vector_database(f_args.get("query", ""), tenant_id)
                     else:
-                        tool_result = f"ERROR: tool '{f_name}' is not available at this stage."
-                        logger.warning(f"[tool] Unexpected tool in ORDER state: {f_name}")
-
+                        tool_result = "Tool not available at this stage."
                     session.messages.append({
-                        "role":         "tool",
-                        "tool_call_id": tc.id,
-                        "name":         f_name,
-                        "content":      tool_result,
+                        "role": "tool", "tool_call_id": tc.id,
+                        "name": tc.function.name, "content": tool_result,
                     })
-                continue  # loop back so LLM generates a text reply after tool result
+                continue
 
             # ── Plain text reply ───────────────────────────────────────────
-            raw_reply   = msg.content or ""
+            raw_reply = msg.content or ""
+
+            # IMPORTANT: detect ORDER_CONFIRMED BEFORE stripping it
+            order_confirmed, order_summary = _detect_order_confirmation(raw_reply)
+
+            # Now strip internal tags from the customer-facing reply
             final_reply = strip_hallucinations(raw_reply)
-
-            if not final_reply or len(final_reply) < 8:
+            if not final_reply.strip():
                 final_reply = "What would you like to order?"
-                break
-
-            # ── Server-side order confirmation detection ───────────────────
-            # We look for the LLM asking "just to confirm — you'd like X, right?"
-            # or the customer explicitly confirming in this same message.
-            # Strategy: if the reply contains a confirmation question AND the
-            # last customer message is affirmative, extract the order and advance.
-            order_confirmed, order_summary = _detect_order_confirmation(
-                llm_reply=final_reply,
-                customer_message=request.message,
-                conversation=session.messages,
-            )
 
             if order_confirmed and order_summary:
                 session.collected.order_summary = order_summary
@@ -861,23 +857,19 @@ async def chat_endpoint(request: ChatRequest):
                     State.CONFIRM if session.checkout_field == CheckoutField.DONE
                     else State.CHECKOUT
                 )
-                logger.info(f"[order_confirmed] summary='{order_summary}' → {session.status.value}")
-
-                # Strip the confirmation question from the reply — the LLM will
-                # generate the first checkout question fresh with the new prompt.
+                logger.info(f"[order] confirmed='{order_summary}' next={session.status.value}")
                 _refresh_system_prompt(session, brand, raw_prompt)
                 session.messages.append({"role": "assistant", "content": final_reply})
                 msg2 = call_llm(client, tenant["model_name"], session.messages)
                 final_reply = msg2.content or ""
-                # Prevent double-append below
                 session.messages.append({"role": "assistant", "content": final_reply})
                 return _response(session, final_reply)
 
-            break  # plain reply, no confirmation → send to customer
+            break
 
         else:
-            final_reply = "I'm having trouble. Could you please describe your order again?"
-            logger.error("[tool_loop] Exhausted MAX_TOOL_ITERS in STATE_ORDER")
+            final_reply = "Sorry, I'm having trouble. What would you like to order?"
+            logger.error("[order_loop] Exhausted MAX_TOOL_ITERS")
 
     # ── STATE: DONE (shouldn't normally receive messages, but handle gracefully)
     else:
@@ -914,6 +906,66 @@ def _response(session: Session, reply: str) -> dict:
             "is_global_customer": session.is_global_customer,
             "is_tenant_customer": session.is_tenant_customer,
         }
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Debug endpoint — REMOVE IN PRODUCTION
+# Call this to inspect what the DB is returning for a given restaurant number
+# GET /debug/tenant?to_number=+14165550001
+# ─────────────────────────────────────────────────────────────────────────────
+from fastapi.responses import JSONResponse
+
+@app.delete("/session/{from_number}")
+async def reset_session(from_number: str):
+    """Force-clear a session for a given customer phone number."""
+    phone = from_number.replace("-", "+")  # allow URL-safe format
+    if phone in _sessions:
+        del _sessions[phone]
+        return {"cleared": True, "from_number": phone}
+    return {"cleared": False, "from_number": phone, "reason": "no active session"}
+
+
+@app.get("/session/{from_number}")
+async def get_session(from_number: str):
+    """Inspect the current session state for a customer. Debug only."""
+    phone = from_number.replace("-", "+")
+    session = _sessions.get(phone)
+    if not session:
+        return {"session": None}
+    return {
+        "session_id":   session.session_id,
+        "status":       session.status.value,
+        "checkout_field": session.checkout_field.value,
+        "collected":    {
+            "full_name":     session.collected.full_name,
+            "address":       session.collected.address,
+            "email":         session.collected.email,
+            "order_summary": session.collected.order_summary,
+        },
+        "message_count": len(session.messages),
+        "last_messages": [
+            {"role": m["role"], "content": (m.get("content") or "")[:120]}
+            for m in session.messages[-6:]
+        ],
+    }
+
+
+@app.get("/debug/tenant")
+async def debug_tenant(to_number: str):
+    tenant = db_get_tenant(to_number)
+    if not tenant:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    raw_prompt = tenant["system_prompt"]
+    cleaned    = _clean_base_prompt(raw_prompt, tenant["brand_name"])
+    return {
+        "brand_name":    tenant["brand_name"],
+        "model_name":    tenant["model_name"],
+        "status":        tenant["status"],
+        "raw_prompt":    raw_prompt,
+        "cleaned_prompt": cleaned,
+        "prompt_length": len(cleaned),
+        "looks_ok":      len(cleaned) > 20 and "?" not in cleaned[:50],
     }
 
 
