@@ -227,7 +227,6 @@ def build_system_prompt(session: Session, brand: str, raw_prompt: str) -> str:
     c    = session.collected
 
     if session.status == State.ORDER:
-        # Returning vs new customer context — embedded in prose, no standalone directives
         if session.is_global_customer and c.full_name:
             customer_ctx = f"You are chatting with {c.full_name}, a returning customer. Greet them by name."
         else:
@@ -236,42 +235,44 @@ def build_system_prompt(session: Session, brand: str, raw_prompt: str) -> str:
         return (
             f"{base}\n\n"
             f"{customer_ctx} "
-            f"Your role is to help them choose what to eat from the menu and take their order. "
-            f"Use the query_vector_database tool if they ask about any dish, price, or ingredient. "
-            f"Never mention food items that were not returned by that tool. "
-            f"Do not ask for personal details such as name, address, or email at this point. "
-            f"Once the customer has told you what they want to order, "
-            f"summarize it back to them and ask them to confirm before proceeding. "
-            f"Keep each reply brief and conversational."
+            f"Take their food order. Be direct — like a real waiter, not a chatbot. "
+            f"If the customer names a dish, immediately repeat it back and ask if that is correct. "
+            f"Do not offer extra information, alternatives, or suggestions unless explicitly asked. "
+            f"Only use the query_vector_database tool when the customer asks about a dish, "
+            f"price, or ingredient. "
+            f"Do not ask for name, address, or email. "
+            f"When the customer confirms their order with yes or similar, "
+            f"write ORDER_CONFIRMED: followed by a short list of the confirmed items, "
+            f"then tell them you will collect their delivery details next. "
+            f"The ORDER_CONFIRMED: tag must appear in your reply when the order is confirmed — "
+            f"it is read by the system to advance the conversation."
         )
 
     if session.status == State.CHECKOUT:
         o = c.order_summary
 
         if session.checkout_field == CheckoutField.ADDRESS:
-            task = (
-                f"The customer has confirmed their order ({o}). "
-                f"Ask them for their delivery address. "
-                f"Be brief and friendly. Do not repeat the order. Do not ask for anything else."
-            )
+            next_ask = "delivery address"
+            extra    = ""
         elif session.checkout_field == CheckoutField.NAME:
-            task = (
-                f"You are collecting delivery details for order: {o}. "
-                f"You already have the address. "
-                f"Ask the customer for their full name. "
-                f"Be brief. Do not ask for anything else."
-            )
+            next_ask = "full name"
+            extra    = "You already have their address. "
         elif session.checkout_field == CheckoutField.EMAIL:
-            task = (
-                f"You are finishing up the delivery details for order: {o}. "
-                f"Ask the customer for their email address. "
-                f"Let them know it is optional and they may skip it. "
-                f"One sentence. Do not ask for anything else."
-            )
+            next_ask = "email address"
+            extra    = "Let them know it is optional. "
         else:
-            task = "Ask the customer for any remaining missing delivery information."
+            next_ask = "any remaining delivery information"
+            extra    = ""
 
-        return f"{base}\n\n{task}"
+        return (
+            f"{base}\n\n"
+            f"The food order is confirmed: {o}. "
+            f"You are now collecting delivery information. "
+            f"{extra}"
+            f"Your only job in this message is to ask the customer for their {next_ask}. "
+            f"Do not add commentary, repeat the order, or ask for anything else. "
+            f"Keep it to one short, friendly sentence."
+        )
 
     if session.status == State.CONFIRM:
         email_line = f"Email: {c.email}. " if c.email else ""
@@ -486,8 +487,12 @@ _HALLUC_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+_ORDER_TAG_RE = re.compile(r"ORDER_CONFIRMED:[^.\n]*", re.IGNORECASE)
+
 def strip_hallucinations(text: str) -> str:
-    return _HALLUC_RE.sub("", text).strip()
+    cleaned = _HALLUC_RE.sub("", text)
+    cleaned = _ORDER_TAG_RE.sub("", cleaned)
+    return cleaned.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -512,121 +517,37 @@ def _extract_email(raw: str) -> str:
     return match.group(0) if match else ""
 
 
+# ── Order confirmed signal ────────────────────────────────────────────────────
+# The LLM is instructed to include "ORDER_CONFIRMED:" followed by the items
+# when the customer says yes. The server detects this exact tag — no fuzzy matching.
+_ORDER_CONFIRMED_RE = re.compile(r"ORDER_CONFIRMED:\s*(.+?)(?:\.|$)", re.IGNORECASE)
+
+
 def _detect_order_confirmation(
     llm_reply: str,
     customer_message: str,
     conversation: list,
 ) -> tuple[bool, str]:
     """
-    Determine whether the order has been confirmed by the customer.
+    Detect order confirmation via a strict server-readable tag.
 
-    Two-phase detection:
-    ─────────────────────────────────────────────────────────────────
-    PHASE A — LLM asked a confirmation question AND customer said YES.
-      The LLM reply contains a confirmation question pattern
-      (e.g. "just to confirm, you'd like X, right?") AND the current
-      customer message is affirmative. We extract the order summary
-      from the LLM's confirmation question.
-
-    PHASE B — Customer message itself explicitly confirms with items.
-      e.g. "yes, I want 1 roast chicken" or "confirm: roast chicken"
-      We extract the items from the customer's own message.
-
-    Returns (confirmed: bool, order_summary: str).
-    order_summary is empty string when confirmed=False.
+    The LLM is instructed to write "ORDER_CONFIRMED: <items>" when the
+    customer confirms. The server looks for this tag — nothing else.
+    This eliminates all fuzzy matching that was causing false positives.
     """
-    reply_lower   = llm_reply.lower()
-    customer_lower = customer_message.strip().lower()
-
-    # ── Phase A: LLM asked a confirm question, customer replied YES ────────────
-    _CONFIRM_TRIGGERS = (
-        "just to confirm",
-        "to confirm your order",
-        "confirm —",
-        "confirming your order",
-        "so you'd like",
-        "you'd like",
-        "you want",
-        "your order is",
-        "is that right",
-        "is that correct",
-        "shall i proceed",
-        "ready to place",
-        "place your order",
-    )
-    llm_asked_confirmation = any(t in reply_lower for t in _CONFIRM_TRIGGERS)
-
-    if llm_asked_confirmation and _is_affirmative(customer_message):
-        # Extract the order summary from the LLM's confirmation sentence.
-        # Look for the last assistant message that contained a confirmation question.
-        order_summary = _extract_order_from_text(llm_reply)
-        if order_summary:
-            return True, order_summary
-
-        # Fallback: search the last few assistant messages for one with items
-        for msg in reversed(conversation):
-            if msg.get("role") == "assistant" and msg.get("content"):
-                summary = _extract_order_from_text(msg["content"])
-                if summary:
-                    return True, summary
-
-    # ── Phase B: Customer message itself contains items + confirmation ─────────
-    _CUSTOMER_ORDER_PREFIXES = (
-        "yes,", "yes ", "si,", "sí,",
-        "confirm:", "order:", "i want", "i'd like",
-        "quiero", "me das", "ponme",
-    )
-    if any(customer_lower.startswith(p) for p in _CUSTOMER_ORDER_PREFIXES):
-        summary = _extract_order_from_text(customer_message)
-        if summary:
+    match = _ORDER_CONFIRMED_RE.search(llm_reply)
+    if match:
+        summary = match.group(1).strip()
+        if summary and len(summary) > 2:
             return True, summary
-
     return False, ""
 
 
-# Menu item keywords used by _extract_order_from_text.
-# Extend this list to match your real menu items from the vector DB.
-_MENU_ITEM_RE = re.compile(
-    r"(\d+\s*x?\s*)?"                          # optional qty: "2x" or "2 "
-    r"("
-    r"roast chicken|chicken|pollo"
-    r"|yuca|yuca frita"
-    r"|salad|ensalada"
-    r"|salmon|salmón"
-    r"|[a-z ]{3,30}"                             # fallback: any 3-30 char word sequence
-    r")",
-    re.IGNORECASE,
-)
-
-_ITEM_STOP_WORDS = {
-    "the", "a", "an", "your", "our", "their", "its", "this", "that",
-    "my", "your", "right", "correct", "order", "like", "want", "would",
-    "you", "i", "is", "are", "was", "to", "for", "of", "with", "and",
-    "just", "confirm", "confirming", "confirmed", "please", "okay", "ok",
-    "so", "as", "in", "at", "on", "up", "no", "not", "yes", "si",
-}
-
-
 def _extract_order_from_text(text: str) -> str:
-    """
-    Extract a cleaned order summary from a sentence.
-    Looks for quantity + item patterns like "1x Roast Chicken, 2x Yuca".
-    Returns empty string if nothing recognisable is found.
-    """
-    # Prefer explicit "Nx item" patterns
+    """Legacy helper — kept for potential future use."""
     qty_item = re.findall(r"\d+\s*x?\s+[A-Za-z][a-z ]{2,25}", text)
     if qty_item:
         return ", ".join(q.strip() for q in qty_item)
-
-    # Fallback: extract capitalised / known food nouns after a colon or "like"
-    after_colon = re.search(r"(?:like|order is|you'd like|you want|confirm[^:]*:)\s*(.+?)(?:\.|,|\?|$)",
-                            text, re.IGNORECASE)
-    if after_colon:
-        candidate = after_colon.group(1).strip()
-        words = [w for w in candidate.split() if w.lower() not in _ITEM_STOP_WORDS]
-        if words:
-            return " ".join(words)
-
     return ""
 
 
