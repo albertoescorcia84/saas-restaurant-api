@@ -193,11 +193,26 @@ _LEGACY_RE = re.compile(
 )
 
 def _clean_base_prompt(raw: str, brand: str) -> str:
+    """
+    Sanitize and format the DB-stored base prompt.
+    Uses safe_substitute-style approach: only fills known keys,
+    ignores unknown {placeholders} that may exist in the raw prompt.
+    Falls back to a minimal default if the prompt is empty or broken.
+    """
     cleaned = _LEGACY_RE.sub("", raw).strip()
-    return cleaned.format(
-        restaurant_name=brand,
-        menu_context="[retrieved via query_vector_database tool]"
-    )
+
+    # Replace only the known placeholders — don't crash on unknown ones
+    try:
+        cleaned = cleaned.replace("{restaurant_name}", brand)
+        cleaned = cleaned.replace("{menu_context}", "our menu")
+    except Exception:
+        pass
+
+    if not cleaned or len(cleaned) < 10:
+        # Minimal safe fallback if DB prompt is empty or completely stripped
+        cleaned = f"You are a helpful ordering assistant for {brand}."
+
+    return cleaned
 
 
 def build_system_prompt(session: Session, brand: str, raw_prompt: str) -> str:
@@ -212,66 +227,76 @@ def build_system_prompt(session: Session, brand: str, raw_prompt: str) -> str:
     c    = session.collected
 
     if session.status == State.ORDER:
-        customer_line = (
-            f"The customer's name is {c.full_name} — greet them warmly by name."
-            if session.is_global_customer and c.full_name
-            else "You don't know the customer's name yet. Don't ask for it now."
-        )
+        if session.is_global_customer and c.full_name:
+            greeting_instruction = (
+                f"The person messaging is a returning customer named {c.full_name}. "
+                f"Start by greeting them by name."
+            )
+        else:
+            greeting_instruction = "Start with a friendly greeting. Do not ask for the customer's name."
+
         return (
             f"{base}\n\n"
-            f"{customer_line}\n\n"
-            f"You are a warm, conversational order-taking assistant. "
-            f"Help the customer decide what to eat. "
-            f"Use the query_vector_database tool whenever they ask about dishes, prices, or ingredients. "
-            f"Never invent or assume menu items — only use data the tool returns. "
-            f"Do not ask for their name, address, or email — that comes later. "
-            f"Do not write function calls, tags, or markers in your reply. "
-            f"Keep replies short and friendly — one idea at a time. "
-            f"When the customer seems ready to confirm their order, ask them clearly: "
-            f"'Just to confirm — you'd like [items], right?' and wait for a yes or no."
+            f"{greeting_instruction} "
+            f"You are a friendly restaurant assistant helping the customer order food. "
+            f"Only talk about the menu — do not ask for delivery address, name, or email yet. "
+            f"If the customer asks about dishes, prices, or ingredients, "
+            f"use the query_vector_database tool to look it up — never guess. "
+            f"Once the customer decides what they want, confirm it back naturally, for example: "
+            f"'Perfect! So that's 1x Roast Chicken — shall I go ahead with that?' "
+            f"Wait for the customer to say yes before moving forward. "
+            f"Keep every reply short — one or two sentences maximum."
         )
 
     if session.status == State.CHECKOUT:
-        questions = {
-            CheckoutField.ADDRESS: (
-                f"The customer just confirmed their order. "
-                f"Now you need their delivery address. "
-                f"Ask for it in a warm, natural way — one short sentence only. "
-                f"Do not mention the order again. Do not ask for anything else."
-            ),
-            CheckoutField.NAME: (
-                f"You have the customer's address. Now you need their full name for the order. "
-                f"Ask for it naturally in one short sentence. Nothing else."
-            ),
-            CheckoutField.EMAIL: (
-                f"Almost done! You just need the customer's email address. "
-                f"Let them know it's optional — they can skip it if they prefer. "
+        order = c.order_summary
+
+        if session.checkout_field == CheckoutField.ADDRESS:
+            task = (
+                f"The customer just ordered: {order}. "
+                f"Your next message should warmly ask for their delivery address — "
+                f"nothing else. One natural sentence, like you would say it on the phone."
+            )
+        elif session.checkout_field == CheckoutField.NAME:
+            task = (
+                f"You are collecting delivery info for the order: {order}. "
+                f"You already have the address. "
+                f"Ask the customer for their full name in a natural, friendly way. "
+                f"One sentence only — do not ask for anything else."
+            )
+        elif session.checkout_field == CheckoutField.EMAIL:
+            task = (
+                f"You are almost done collecting info for the order: {order}. "
+                f"You have the name and address. "
+                f"Politely ask for their email. Make clear it's optional and they can skip it. "
                 f"One sentence only."
-            ),
-        }
-        instruction = questions.get(session.checkout_field, "Ask for the missing information politely.")
-        return f"{base}\n\n{instruction}"
+            )
+        else:
+            task = "Politely ask the customer for any remaining missing information."
+
+        return f"{base}\n\n{task}"
 
     if session.status == State.CONFIRM:
-        email_line = f"\n- Email: {c.email}" if c.email else ""
+        email_part = f", email {c.email}" if c.email else ""
         return (
             f"{base}\n\n"
-            f"You have all the information. Read the order details back to the customer "
-            f"in a warm, conversational tone — as if you were a real person confirming over the phone. "
-            f"Include their name ({c.full_name}), delivery address ({c.address}), "
-            f"and order ({c.order_summary}).{(' Their email: ' + c.email + '.') if c.email else ''} "
-            f"After presenting the details, ask if everything is correct. "
-            f"Write naturally — no bullet points, no headers. "
-            f"Do not call any tool. Do not save anything yet."
+            f"You are about to confirm an order. Tell the customer in a warm, human tone:\n"
+            f"- Their name: {c.full_name}\n"
+            f"- Delivery address: {c.address}\n"
+            f"- Order: {c.order_summary}{email_part}\n\n"
+            f"After reading those back, ask something like: "
+            f"'Does everything look right?' "
+            f"Write it as natural speech — no technical labels, no bullet points in your reply. "
+            f"Do not save or call any tool yet."
         )
 
     if session.status == State.DONE:
         return (
             f"{base}\n\n"
-            f"The order has been saved. Write a warm, human closing message for {c.full_name}. "
-            f"Confirm their order ({c.order_summary}) will be delivered to {c.address}. "
-            f"Optionally mention their reference ID: {c.customer_id}. "
-            f"Keep it to two sentences. Sound enthusiastic and genuine."
+            f"The order is confirmed and saved. Send a short closing message to {c.full_name} "
+            f"confirming that {c.order_summary} will be delivered to {c.address}. "
+            f"You can mention reference ID {c.customer_id} if you like. "
+            f"Two sentences max. Be warm and genuine — sound like a real person, not a robot."
         )
 
     return base  # fallback
