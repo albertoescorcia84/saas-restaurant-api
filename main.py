@@ -792,35 +792,31 @@ async def chat_endpoint(request: ChatRequest):
         else:
             session.checkout_field = next_field
 
-        # LLM generates the next question — with hardcoded fallback per field
-        _refresh_system_prompt(session, brand, raw_prompt, menu_text)
-        msg = call_llm(client, tenant["model_name"], session.messages)
-        final_reply = (msg.content or "").strip()
-
-        # Fallback: if LLM returns empty, use a simple direct question
-        if not final_reply:
-            _FALLBACKS = {
-                CheckoutField.ADDRESS: "What is your delivery address?",
-                CheckoutField.NAME:    "What is your full name?",
-                CheckoutField.EMAIL:   "What is your email address? (optional — you can skip this)",
-            }
-            # Use the CURRENT state's field (after advancing)
-            current_field = (
-                session.checkout_field
-                if session.status == State.CHECKOUT
-                else CheckoutField.ADDRESS
+        # If we just reached CONFIRM — generate summary directly, no LLM
+        if session.status == State.CONFIRM:
+            c = session.collected
+            email_line = f", email {c.email}" if c.email else ""
+            final_reply = (
+                f"Perfect! Let me confirm your order: {c.order_summary}, "
+                f"delivering to {c.address} for {c.full_name}{email_line}. "
+                f"Does everything look correct?"
             )
-            final_reply = _FALLBACKS.get(current_field, "Could you provide the missing information?")
-
-            if session.status == State.CONFIRM:
-                c = session.collected
-                final_reply = (
-                    f"Just to confirm your order: {c.order_summary}, "
-                    f"delivering to {c.address} for {c.full_name}. "
-                    f"Is everything correct?"
-                )
+        else:
+            # Still in CHECKOUT — LLM asks for next field
+            _FALLBACKS = {
+                CheckoutField.ADDRESS: "Great! And what's your delivery address?",
+                CheckoutField.NAME:    "Got it! Could I get your full name?",
+                CheckoutField.EMAIL:   "Almost done! What's your email? You can skip this if you prefer.",
+            }
+            _refresh_system_prompt(session, brand, raw_prompt, menu_text)
+            msg = call_llm(client, tenant["model_name"], session.messages)
+            final_reply = (msg.content or "").strip()
+            if not final_reply:
+                final_reply = _FALLBACKS.get(session.checkout_field, "Could you provide the missing information?")
 
     # ── STATE: CONFIRM (explicit YES / NO detection) ──────────────────────────
+    # The server generates the confirmation message directly — no LLM.
+    # This prevents the LLM from generating a premature closing message.
     elif session.status == State.CONFIRM:
         confirmed = _is_affirmative(request.message)
 
@@ -940,7 +936,15 @@ async def chat_endpoint(request: ChatRequest):
                 final_reply = "What would you like to order?"
 
             if order_confirmed and order_summary:
-                session.collected.order_summary = order_summary
+                # Clean the summary — remove conversational filler, keep items + prices
+                clean_summary = order_summary.strip()
+                # Strip leading filler phrases the LLM adds
+                for filler in ("you're good with ", "so just ", "that's ", "just ",
+                               "i'll confirm ", "your order is ", "so you want "):
+                    if clean_summary.lower().startswith(filler):
+                        clean_summary = clean_summary[len(filler):]
+                        break
+                session.collected.order_summary = clean_summary.strip().rstrip(".")
                 session.checkout_field = _determine_first_checkout_field(session)
                 session.status = (
                     State.CONFIRM if session.checkout_field == CheckoutField.DONE
