@@ -421,8 +421,8 @@ def db_save_customer(
 
         conn.execute(text("""
             INSERT INTO tenant_customer_addresses
-                (id, tenant_customer_id, address_line_1, is_default, city, state, country)
-            VALUES (gen_random_uuid(), :tcid, :addr, true, 'Toronto', 'ON', 'Canada')
+                (id, tenant_customer_id, address_line_1, is_default, city, state)
+            VALUES (gen_random_uuid(), :tcid, :addr, true, 'Toronto', 'ON')
         """), {"tcid": tc_id, "addr": address})
         logger.info(f"[db] address saved for tc_id={tc_id}")
 
