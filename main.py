@@ -373,25 +373,32 @@ def db_save_customer(
 ) -> str:
     """
     Upsert customer → tenant link → address.
-    Returns the customer UUID as string.
-    Raises on DB error (caller handles).
+    Schema facts:
+      - customers.id          : uuid, no default → must pass gen_random_uuid()
+      - tenant_customers.id   : uuid, default gen_random_uuid() → can omit
+      - tenant_customers col  : tenant_specific_status (not 'status'), default 'Active'
+      - tenant_customer_addresses: no unique(tenant_customer_id, is_default) →
+        use UPDATE then INSERT pattern instead of ON CONFLICT
     """
     with engine.begin() as conn:
-        # 1. Upsert global customer
+
+        # ── 1. Upsert global customer ─────────────────────────────────────────
         row = conn.execute(text("""
-            INSERT INTO customers (phone_number, full_name, email)
-            VALUES (:ph, :name, :em)
+            INSERT INTO customers (id, phone_number, full_name, email)
+            VALUES (gen_random_uuid(), :ph, :name, :em)
             ON CONFLICT (phone_number) DO UPDATE
                 SET full_name = EXCLUDED.full_name,
                     email     = COALESCE(EXCLUDED.email, customers.email)
             RETURNING id
         """), {"ph": user_phone, "name": full_name, "em": email or None}).fetchone()
         customer_id = row[0]
+        logger.info(f"[db] customer upserted id={customer_id}")
 
-        # 2. Ensure tenant ↔ customer relationship
+        # ── 2. Ensure tenant ↔ customer link ──────────────────────────────────
+        # Column is tenant_specific_status with default 'Active' (capital A)
         tc_row = conn.execute(text("""
-            INSERT INTO tenant_customers (tenant_id, customer_id)
-            VALUES (:tid, :cid)
+            INSERT INTO tenant_customers (tenant_id, customer_id, tenant_specific_status)
+            VALUES (:tid, :cid, 'Active')
             ON CONFLICT (tenant_id, customer_id) DO NOTHING
             RETURNING id
         """), {"tid": tenant_id, "cid": customer_id}).fetchone()
@@ -402,23 +409,24 @@ def db_save_customer(
                 WHERE tenant_id = :tid AND customer_id = :cid
             """), {"tid": tenant_id, "cid": customer_id}).fetchone()
         tc_id = tc_row[0]
+        logger.info(f"[db] tenant_customer id={tc_id}")
 
-        # 3. Upsert default delivery address
+        # ── 3. Address — no unique constraint on (tenant_customer_id, is_default)
+        # Pattern: clear old default → insert new one
+        conn.execute(text("""
+            UPDATE tenant_customer_addresses
+               SET is_default = false
+             WHERE tenant_customer_id = :tcid
+        """), {"tcid": tc_id})
+
         conn.execute(text("""
             INSERT INTO tenant_customer_addresses
-                (tenant_customer_id, address_line_1, is_default, city, state, country)
-            VALUES (:tcid, :addr, true, 'Toronto', 'ON', 'Canada')
-            ON CONFLICT (tenant_customer_id, is_default) DO UPDATE
-                SET address_line_1 = EXCLUDED.address_line_1
+                (id, tenant_customer_id, address_line_1, is_default, city, state, country)
+            VALUES (gen_random_uuid(), :tcid, :addr, true, 'Toronto', 'ON', 'Canada')
         """), {"tcid": tc_id, "addr": address})
+        logger.info(f"[db] address saved for tc_id={tc_id}")
 
-        # 4. Insert order record (uncomment when orders table exists)
-        # conn.execute(text("""
-        #     INSERT INTO orders (tenant_customer_id, summary, status, created_at)
-        #     VALUES (:tcid, :summary, 'pending', NOW())
-        # """), {"tcid": tc_id, "summary": order_summary})
-
-    logger.info(f"[db_save_customer] Saved customer_id={customer_id}")
+    logger.info(f"[db_save_customer] Done — customer_id={customer_id}")
     return str(customer_id)
 
 
@@ -840,15 +848,21 @@ async def chat_endpoint(request: ChatRequest):
                 logger.info(f"[save] customer_id={customer_id} order='{c.order_summary}'")
 
             except Exception as db_err:
-                logger.error(f"[save] DB error: {db_err}")
-                # Don't crash the conversation — tell the customer and stay in CONFIRM
+                import traceback
+                tb = traceback.format_exc()
+                logger.error(f"[save] DB error: {db_err}\nTraceback:\n{tb}")
+                logger.error(f"[save] Data attempted: phone={user_phone} tenant={tenant_id} "
+                             f"name={c.full_name!r} address={c.address!r} email={c.email!r}")
                 session.status = State.CONFIRM
+                # Return the actual error in debug so we can see it
                 final_reply = (
                     "I'm sorry, there was a technical issue saving your order. "
                     "Please reply YES again to retry."
                 )
                 session.messages.append({"role": "assistant", "content": final_reply})
-                return _response(session, final_reply)
+                resp = _response(session, final_reply)
+                resp["_db_error"] = str(db_err)  # visible in response for debugging
+                return resp
 
             # Generate closing message with LLM
             _refresh_system_prompt(session, brand, raw_prompt, menu_text)
