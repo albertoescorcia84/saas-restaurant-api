@@ -126,6 +126,7 @@ class CustomerData:
     order_total:       float = 0.0
     service_type:      str = ""
     delivery_fee:      float = 0.0
+    order_number:      str = ""        # ← nuevo
     customer_id:       Optional[str] = None
 
 
@@ -282,6 +283,118 @@ def db_save_customer(user_phone, tenant_id, full_name, address, email, order_sum
     logger.info(f"[db_save] customer_id={customer_id}")
     return str(customer_id)
 
+def _generate_order_number(tenant_id: str) -> str:
+    """Generate readable order number: TEN-YYYYMMDD-XXXX"""
+    prefix  = tenant_id.replace("-", "")[:3].upper()
+    date    = datetime.now().strftime("%Y%m%d")
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT COUNT(*) FROM orders
+            WHERE tenant_id = :tid
+            AND DATE(order_date) = CURRENT_DATE
+        """), {"tid": tenant_id}).fetchone()
+    seq = str((row[0] or 0) + 1).zfill(4)
+    return f"{prefix}-{date}-{seq}"
+
+def db_save_order(
+    session_id:    str,
+    tenant_id:     str,
+    customer_id:   Optional[str],
+    customer_name: str,
+    customer_phone: str,
+    customer_email: Optional[str],
+    service_type:  str,
+    delivery_address: str,
+    order_summary: str,
+    order_total:   float,
+    delivery_fee:  float,
+    notes:         Optional[str] = None,
+) -> str:
+    """
+    Parse order_summary into line items and save orders + order_items.
+    order_summary format: "Half Chicken ($12) | Yuca ($4)"
+    Returns order_number.
+    """
+    order_number = _generate_order_number(tenant_id)
+    subtotal     = order_total
+    grand_total  = order_total + delivery_fee
+
+    with engine.begin() as conn:
+        # ── Insert order header ───────────────────────────────────────────
+        row = conn.execute(text("""
+            INSERT INTO orders (
+                order_number, tenant_id, customer_id,
+                customer_name, customer_phone, customer_email,
+                service_type, delivery_address,
+                subtotal, tax_total, tip_total,
+                delivery_total, grand_total,
+                notes, session_id
+            ) VALUES (
+                :num, :tid, :cid,
+                :name, :phone, :email,
+                :stype, :addr,
+                :sub, 0, 0,
+                :del, :grand,
+                :notes, :sid
+            ) RETURNING id
+        """), {
+            "num":   order_number,
+            "tid":   tenant_id,
+            "cid":   customer_id,
+            "name":  customer_name,
+            "phone": customer_phone,
+            "email": customer_email or None,
+            "stype": service_type,
+            "addr":  delivery_address or "",
+            "sub":   round(subtotal, 2),
+            "del":   round(delivery_fee, 2),
+            "grand": round(grand_total, 2),
+            "notes": notes,
+            "sid":   session_id,
+        }).fetchone()
+        order_id = row[0]
+
+        # ── Parse and insert line items ───────────────────────────────────
+        # Try to parse "Item Name ($X.XX)" or "Item Name: $X.XX" patterns
+        _item_re = re.compile(
+            r"([^|$\n]+?)\s*[\(\:]?\s*\$(\d+(?:\.\d{1,2})?)",
+            re.IGNORECASE
+        )
+        segments = [s.strip() for s in order_summary.split("|") if s.strip()]
+        if not segments:
+            segments = [order_summary.strip()]
+
+        for seg in segments:
+            m = _item_re.search(seg)
+            if m:
+                name  = m.group(1).strip().strip("(,.-").strip()
+                price = float(m.group(2))
+            else:
+                # Fallback: use full segment as name, price 0
+                name  = seg.strip()
+                price = 0.0
+
+            if not name:
+                continue
+
+            conn.execute(text("""
+                INSERT INTO order_items
+                    (order_id, line_type, item_name, quantity, unit_price, line_total)
+                VALUES
+                    (:oid, 'item', :name, 1, :price, :price)
+            """), {"oid": order_id, "name": name, "price": round(price, 2)})
+
+        # ── Insert delivery line if applicable ────────────────────────────
+        if delivery_fee > 0:
+            conn.execute(text("""
+                INSERT INTO order_items
+                    (order_id, line_type, item_name, quantity, unit_price, line_total)
+                VALUES
+                    (:oid, 'delivery', 'Delivery fee', 1, :fee, :fee)
+            """), {"oid": order_id, "fee": round(delivery_fee, 2)})
+
+    logger.info(f"[db_save_order] order_number={order_number} grand_total={grand_total}")
+    return order_number
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Menu
@@ -906,6 +1019,24 @@ async def chat_endpoint(request: ChatRequest):
                 )
                 
                 session.collected.customer_id = customer_id
+
+                # Save order to orders + order_items
+                order_number = db_save_order(
+                    session_id       = session.session_id,
+                    tenant_id        = ctx.tenant_id,
+                    customer_id      = customer_id,
+                    customer_name    = c.full_name,
+                    customer_phone   = user_phone,
+                    customer_email   = c.email or None,
+                    service_type     = c.service_type,
+                    delivery_address = c.address or "",
+                    order_summary    = c.order_summary,
+                    order_total      = c.order_total,
+                    delivery_fee     = c.delivery_fee,
+                )
+                session.collected.order_number = order_number
+
+
                 session.status                = State.DONE
                 _refresh_system_prompt(session)
                 msg         = call_llm(client, ctx.model_name, session.messages)
@@ -935,7 +1066,7 @@ async def chat_endpoint(request: ChatRequest):
                                         f"{'Delivery to: ' + c.address + chr(10) if c.service_type == 'delivery' else ''}"
                                         f"{'Delivery fee: $' + f'{c.delivery_fee:.2f}' + chr(10) if c.delivery_fee > 0 else ''}"
                                         f"Total: ${total:.2f}\n\n"
-                                        f"Reference: {customer_id}\n\n"
+                                        f"Reference: {order_number}\n\n"
                                         f"Thank you for ordering from {ctx.brand_name}!"
                                     ),
                                     "sender_tagline": ctx.brand_name,
@@ -951,12 +1082,13 @@ async def chat_endpoint(request: ChatRequest):
                 # Safety net: if LLM asks another question or is empty, use hardcoded closing
                 closing_bad = ("correct", "correcto", "look good", "everything", "todo", "?")
                 if not final_reply or any(t in final_reply.lower() for t in closing_bad):
+                    total = c.order_total + c.delivery_fee
                     final_reply = (
                         f"¡Listo, {c.full_name}! Tu pedido está confirmado. "
-                        f"Referencia: {customer_id}. Total: ${total:.2f}. ¡Gracias y buen provecho!"
+                        f"Orden: {order_number}. Total: ${total:.2f}. ¡Gracias y buen provecho!"
                         if session.language == "es" else
                         f"You're all set, {c.full_name}! Order confirmed. "
-                        f"Reference: {customer_id}. Total: ${total:.2f}. Thank you and enjoy your meal!"
+                        f"Order: {order_number}. Total: ${total:.2f}. Thank you and enjoy your meal!"
                     )
             except Exception as e:
                 logger.error(f"[save] error: {e}")
