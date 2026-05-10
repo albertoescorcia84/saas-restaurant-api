@@ -648,8 +648,9 @@ def build_system_prompt(session: Session) -> str:
         avail_types = [s.service_type for s in avail]
         if not avail:
             service_note = (
-                "IMPORTANT: Currently no services are available (outside operating hours). "
-                "Apologize and tell the customer our current hours. Do not take an order."
+                "CRITICAL: We are currently CLOSED. Do NOT take any order, do NOT offer menu items. "
+                "Only inform the customer of our operating hours and wish them well. "
+                "If they say anything else, repeat that we are closed and share the hours."
             )
         else:
             service_note = (
