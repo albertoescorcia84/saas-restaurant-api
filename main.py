@@ -788,7 +788,7 @@ def build_system_prompt(session: "Session") -> str:
         return (
             f"{base}\n\n{li}"
             f"Order is placed! Thank {c.full_name or 'the customer'} warmly. "
-            f"Give reference number {c.customer_id}. Total: ${total:.2f}. "
+            f"Give reference number {c.order_number}. Total: ${total:.2f}. "
             f"Two sentences max. Do NOT ask any more questions."
         )
 
