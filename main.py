@@ -129,21 +129,22 @@ class ServiceInfo:
 
 @dataclass
 class TenantContext:
-    """Full tenant context loaded once per session."""
-    tenant_id:       str
-    brand_name:      str
-    status:          str
-    system_prompt:   str
-    model_name:      str
-    api_key:         str
-    timezone:        str            # e.g. "America/Toronto"
+    tenant_id:        str
+    brand_name:       str
+    status:           str
+    system_prompt:    str
+    model_name:       str
+    api_key:          str
+    timezone:         str
     physical_address: str
-    city:            str
-    state:           str
-    country:         str
-    services:        dict[str, ServiceInfo] = field(default_factory=dict)
-    menu_text:       str = ""
-    menu_categories: list[str] = field(default_factory=list)
+    city:             str
+    state:            str
+    country:          str
+    primary_language:    str = "en"           # ← nuevo
+    supported_languages: list[str] = field(default_factory=lambda: ["en"])  # ← nuevo
+    services:         dict[str, ServiceInfo] = field(default_factory=dict)
+    menu_text:        str = ""
+    menu_categories:  list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -207,6 +208,8 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
                 t.state,
                 t.country,
                 s.system_prompt,
+                s.primary_language,
+                s.supported_languages,
                 m.model_name,
                 m.api_key
             FROM tenants t
@@ -238,6 +241,8 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
         city             = row["city"] or "",
         state            = row["state"] or "",
         country          = row["country"] or "",
+        primary_language    = row["primary_language"] or "en",
+        supported_languages = [l.strip() for l in (row["supported_languages"] or "en").split(",")],
     )
 
     for s in svc_rows:
@@ -577,16 +582,42 @@ def _classify_confirmation(client: Groq, model: str, message: str) -> str:
     return "other"
 
 
-def _detect_language(message: str) -> str:
-    """Simple heuristic language detection — es vs en."""
+def _detect_language(message: str, supported: list[str]) -> str:
+    """
+    Detect language from message, restricted to tenant's supported languages.
+    Falls back to first supported language if detection is unclear.
+    """
+    default = supported[0] if supported else "en"
+
     spanish_words = {
         "hola", "buenos", "buenas", "gracias", "por favor", "quiero",
         "quisiera", "tengo", "puedo", "favor", "como", "qué", "que",
-        "sí", "si", "no", "me", "mi", "tu", "es", "un", "una",
+        "sí", "me", "mi", "tu", "es", "un", "una", "para", "con",
     }
+    french_words = {
+        "bonjour", "bonsoir", "merci", "s'il", "voudrais", "je", "vous",
+        "nous", "est", "pas", "avec", "pour", "une", "les", "des",
+    }
+    bengali_words = {"আমি", "আপনি", "কি", "হ্যালো", "ধন্যবাদ"}
+
     words = set(message.lower().split())
-    hits  = len(words & spanish_words)
-    return "es" if hits >= 1 else "en"
+
+    scores: dict[str, int] = {}
+    if "es" in supported:
+        scores["es"] = len(words & spanish_words)
+    if "fr" in supported:
+        scores["fr"] = len(words & french_words)
+    if "bn" in supported:
+        scores["bn"] = len(words & bengali_words)
+
+    # Need at least 2 hits to switch language
+    best_lang  = max(scores, key=scores.get) if scores else default
+    best_score = scores.get(best_lang, 0)
+
+    if best_score >= 2 and best_lang in supported:
+        return best_lang
+
+    return default
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -615,12 +646,14 @@ def build_system_prompt(session: Session) -> str:
     c    = session.collected
     lang = session.language
 
-    lang_instruction = (
-        "Respond ONLY in Spanish (Mexican Spanish). Use warm, casual Mexican expressions "
-        "like '¡Con gusto!', '¡Claro que sí!', '¿Qué le ponemos?'. "
-        if lang == "es" else
-        "Respond in English. Be warm, friendly, and conversational. "
-    )
+    LANG_INSTRUCTIONS = {
+        "en": "Respond ONLY in English. Never switch languages. Be warm and conversational.",
+        "es": "Responde ÚNICAMENTE en español mexicano. Nunca cambies de idioma. Usa expresiones cálidas como '¡Con gusto!', '¡Claro que sí!'.",
+        "fr": "Réponds UNIQUEMENT en français. Ne change jamais de langue. Sois chaleureux et naturel.",
+        "bn": "শুধুমাত্র বাংলায় উত্তর দিন। কখনো ভাষা পরিবর্তন করবেন না।",
+    }
+    lang_instruction = LANG_INSTRUCTIONS.get(session.language, LANG_INSTRUCTIONS["en"])
+    lang_instruction = f"IMPORTANT: {lang_instruction}\n\n"
 
     if session.status == State.ORDER:
         categories = ctx.menu_categories
@@ -924,7 +957,7 @@ async def chat_endpoint(request: ChatRequest):
             tenant_id           = ctx.tenant_id,
             tenant              = ctx,
             status              = State.ORDER,
-            language            = _detect_language(request.message),
+            language            = _detect_language(request.message, ctx.supported_languages),
             collected           = CustomerData(
                 full_name  = cust["full_name"],
                 email      = cust["email"],
@@ -941,9 +974,9 @@ async def chat_endpoint(request: ChatRequest):
         # Refresh service availability on each message (hours may have changed)
         _check_service_availability(session.tenant)
         # Update language detection
-        detected = _detect_language(request.message)
-        if detected == "es" and session.language == "en":
-            session.language = "es"
+        detected = _detect_language(request.message, session.tenant.supported_languages)
+        if detected != session.language and detected in session.tenant.supported_languages:
+            session.language = detected
 
     # ── 3. Build system prompt + append user message ──────────────────────────
     _refresh_system_prompt(session)
