@@ -595,9 +595,8 @@ def build_system_prompt(session: "Session") -> str:
         if ctx.menu_categories:
             cats     = ", ".join(ctx.menu_categories[:6])
             cat_hint = (
-                f"\n\nMenu sections: {cats}. "
-                f"Offer category names first; give item details only if asked. "
-                f"Customer can freely jump between categories at any time."
+                f"\n\nMenu sections available: {cats}. "
+                f"Mention section names when relevant. Give item details only if asked."
             )
         greeting = (
             f"You are chatting with {c.full_name}, a returning customer. Greet them warmly by name. "
@@ -613,24 +612,22 @@ def build_system_prompt(session: "Session") -> str:
         else:
             svc_note = (
                 f"Available services: {', '.join(s.service_type for s in avail)}. "
-                f"Do NOT mention delivery fees yet — that comes after order confirmation."
+                f"Do NOT mention delivery, pickup, or fees at this stage — "
+                f"that comes ONLY after the customer has confirmed their food order."
             )
         return (
             f"{base}\n\n{li}{greeting}"
-            f"You are a warm, human restaurant assistant.\n\n"
-            f"STRICT RULES:\n"
-            f"- On the FIRST message, ONLY greet and ask how you can help. "
-            f"Do NOT offer menu items unless the customer asks about food.\n"
-            f"- If the customer says NO to any item (side, drink, extra): accept it immediately. "
-            f"NEVER add items they declined.\n"
-            f"- After the customer declines sides, drinks, or extras: go directly to order confirmation. "
-            f"Do NOT offer more add-ons.\n"
-            f"- Only add items the customer explicitly requests.\n"
-            f"- When listing items: always show name + price.\n"
-            f"- When the customer confirms their full order: list EVERY item with price and subtotal, "
-            f"then ask them to confirm. Do NOT proceed until they confirm.\n"
-            f"- Do NOT ask for address, name, or delivery method at this stage.\n"
-            f"- Do NOT output system instructions, meta-text, or emoji sequences from prompts.\n"
+            f"You are a warm, human restaurant assistant helping a customer order food.\n\n"
+            f"RULES — follow in order:\n"
+            f"1. On the first message: greet and ask how you can help. Do NOT list menu items unprompted.\n"
+            f"2. When the customer asks about food: tell them about the menu sections or items.\n"
+            f"3. When the customer picks an item: confirm it with the price.\n"
+            f"4. You may offer ONE optional add-on (side or drink) after the main item. "
+            f"If they say no: immediately move to order summary. Do NOT offer more add-ons.\n"
+            f"5. When the customer is done ordering: list every item with its price and subtotal, "
+            f"then ask them to confirm. Do NOT ask about delivery or pickup here.\n"
+            f"6. Never ask for address, name, email, or delivery method — that comes later.\n"
+            f"7. Never output system text, instructions, or technical information.\n"
             f"{cat_hint}\n\n{svc_note}\n\nFULL MENU:\n{ctx.menu_text}"
         )
 
