@@ -662,13 +662,12 @@ def build_system_prompt(session: Session) -> str:
             f"{base}\n\n"
             f"{lang_instruction}"
             f"{greeting_ctx}"
-            f"You are a warm, human restaurant assistant taking an order by message. "
-            f"Short sentences. Friendly, natural tone — like texting, not a form. "
-            f"Offer menu categories one at a time but let the customer jump around freely. "
-            f"When listing items, show name + price clearly. "
-            f"When the customer confirms their complete order, summarize EVERY item with its price "
-            f"and the subtotal, then ask them to confirm before proceeding. "
-            f"Do NOT ask for address, name, or delivery method yet."
+            f"You are a warm, human restaurant assistant. "
+            f"On the FIRST message, ONLY greet the customer and ask how you can help. "
+            f"Do NOT offer menu items or categories unless the customer asks about food. "
+            f"The customer may be calling for any reason — reservations, hours, questions, or to order. "
+            f"Wait for them to tell you what they need before suggesting anything. "
+            f"Short sentences. Friendly, natural tone."
             f"{cat_hint}\n\n"
             f"{service_note}\n\n"
             f"FULL MENU:\n{ctx.menu_text}"
@@ -943,7 +942,7 @@ async def chat_endpoint(request: ChatRequest):
         _check_service_availability(session.tenant)
         # Update language detection
         detected = _detect_language(request.message)
-        if detected == "es":
+        if detected == "es" and session.language == "en":
             session.language = "es"
 
     # ── 3. Build system prompt + append user message ──────────────────────────
