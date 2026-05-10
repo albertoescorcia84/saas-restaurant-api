@@ -398,7 +398,14 @@ async def validate_address_mapbox(address: str, city: str = "") -> dict:
         async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.get(
                 f"https://api.mapbox.com/geocoding/v5/mapbox.places/{query}.json",
-                params={"access_token": MAPBOX_TOKEN, "types": "address", "limit": 3, "language": "en"}
+                params={
+                    "access_token": MAPBOX_TOKEN,
+                    "types":        "address",
+                    "limit":        3,
+                    "language":     "en",
+                    "country":      "ca,us",
+                    "proximity":    "-79.3832,43.6532",
+                }
             )
         features = resp.json().get("features", [])
         if not features:
@@ -413,7 +420,6 @@ async def validate_address_mapbox(address: str, city: str = "") -> dict:
     except Exception as e:
         logger.error(f"[mapbox] Error: {e}")
         return {"valid": True, "canonical": address, "suggestions": []}
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM Classifiers
@@ -615,8 +621,10 @@ def build_system_prompt(session: "Session") -> str:
             f"STRICT RULES:\n"
             f"- On the FIRST message, ONLY greet and ask how you can help. "
             f"Do NOT offer menu items unless the customer asks about food.\n"
-            f"- If the customer says NO to any item (side, drink, extra): accept immediately. "
+            f"- If the customer says NO to any item (side, drink, extra): accept it immediately. "
             f"NEVER add items they declined.\n"
+            f"- After the customer declines sides, drinks, or extras: go directly to order confirmation. "
+            f"Do NOT offer more add-ons.\n"
             f"- Only add items the customer explicitly requests.\n"
             f"- When listing items: always show name + price.\n"
             f"- When the customer confirms their full order: list EVERY item with price and subtotal, "
@@ -676,7 +684,6 @@ def build_system_prompt(session: "Session") -> str:
 
     return base
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM wrapper
 # ─────────────────────────────────────────────────────────────────────────────
@@ -722,10 +729,16 @@ async def chat_endpoint(request: ChatRequest):
     _GREETINGS = {"hello","hi","hola","hey","buenos dias","buenas","good morning",
                   "good afternoon","good evening","start","restart","nuevo","nueva",
                   "buenas tardes","buenas noches"}
-    is_greeting      = request.message.strip().lower() in _GREETINGS
+    _DONE_PHRASES = {"thank you","thanks","gracias","ty","thx","perfecto","ok gracias",
+                     "thank u","muchas gracias","de nada","awesome","great","perfect"}
+    msg_clean        = request.message.strip().lower()
+    is_greeting      = msg_clean in _GREETINGS
+    is_done_phrase   = msg_clean in _DONE_PHRASES
     need_new_session = (
-        not session or session.status == State.DONE
-        or session.tenant_id != ctx.tenant_id or is_greeting
+        not session
+        or (session.status == State.DONE and not is_done_phrase)
+        or session.tenant_id != ctx.tenant_id
+        or is_greeting
     )
 
     client = Groq(api_key=ctx.api_key)
@@ -894,11 +907,49 @@ async def chat_endpoint(request: ChatRequest):
                     user_phone, ctx.tenant_id, c.full_name,
                     c.address or "Pickup", c.email or None, c.order_summary,
                 )
+                
                 session.collected.customer_id = customer_id
                 session.status                = State.DONE
                 _refresh_system_prompt(session)
                 msg         = call_llm(client, ctx.model_name, session.messages)
                 final_reply = strip_hallucinations(msg.content or "")
+
+                # Send order confirmation email
+                if c.email:
+                    try:
+                        chat_api_url = os.getenv("CHAT_API_URL", "https://api.albertoescorcia.ca")
+                        from_email   = os.getenv("FROM_EMAIL", "noreply@albertoescorcia.ca")
+                        from_name    = os.getenv("FROM_NAME", "TenantOS")
+                        total        = c.order_total + c.delivery_fee
+                        async with httpx.AsyncClient(timeout=10.0) as http:
+                            await http.post(
+                                f"{chat_api_url}/notifications/send-email",
+                                json={
+                                    "from_email":     from_email,
+                                    "from_name":      from_name,
+                                    "to":             [{"email": c.email, "name": c.full_name}],
+                                    "subject":        f"Your order at {ctx.brand_name} is confirmed!",
+                                    "title":          f"Order confirmed, {c.full_name.split()[0]}!",
+                                    "body":           (
+                                        f"Hi {c.full_name.split()[0]},\n\n"
+                                        f"Your order has been confirmed!\n\n"
+                                        f"Order: {c.order_summary}\n"
+                                        f"Service: {c.service_type}\n"
+                                        f"{'Delivery to: ' + c.address + chr(10) if c.service_type == 'delivery' else ''}"
+                                        f"{'Delivery fee: $' + f'{c.delivery_fee:.2f}' + chr(10) if c.delivery_fee > 0 else ''}"
+                                        f"Total: ${total:.2f}\n\n"
+                                        f"Reference: {customer_id}\n\n"
+                                        f"Thank you for ordering from {ctx.brand_name}!"
+                                    ),
+                                    "sender_tagline": ctx.brand_name,
+                                    "sender_address": ctx.physical_address,
+                                }
+                            )
+                        logger.info(f"[email] order confirmation sent to {c.email}")
+                    except Exception as e:
+                        logger.error(f"[email] failed: {e}")
+
+
                 total       = c.order_total + c.delivery_fee
                 # Safety net: if LLM asks another question or is empty, use hardcoded closing
                 closing_bad = ("correct", "correcto", "look good", "everything", "todo", "?")
