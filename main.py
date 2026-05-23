@@ -297,7 +297,7 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
         model_name          = row["model_name"],
         api_key             = row["api_key"],
         provider            = row["provider"] or "groq",
-        timezone            = row["timezone"] or ""
+        timezone            = row["timezone"] or "",
         physical_address    = row["physical_address"] or "",
         city                = row["city"] or "",
         state               = row["state"] or "",
