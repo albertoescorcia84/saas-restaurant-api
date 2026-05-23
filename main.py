@@ -1,20 +1,21 @@
 """
-SaaS Restaurant Multi-Tenant Chat API — v4.2
+SaaS Restaurant Multi-Tenant Chat API — v4.3
 =============================================
 Changes in this version:
-  - Provider pattern: supports Groq (LLaMA) and Anthropic (Claude) per tenant
-  - Provider loaded from llm_models.provider column in DB
-  - Groq and Anthropic clients abstracted behind LLMProvider interface
-  - call_llm() simplified to use provider directly
-  - _classify_intent() and _classify_confirmation() use provider
-  - _resolve_timezone_from_address() uses provider
+  - Server-side OrderCart: items, quantity, prep_notes, unit_price, line_total
+  - LLM extracts structured JSON actions (add/remove/modify/confirm)
+  - Cart controls all calculations — LLM never calculates totals
+  - Order confirmation detected from cart state, not from LLM text parsing
+  - build_system_prompt injects today's day/time for accurate hours
 """
 
 import os
 import re
 import uuid
+import json
 import logging
 import httpx
+import zoneinfo as zi
 from datetime import datetime, time
 from enum import Enum
 from dataclasses import dataclass, field
@@ -46,14 +47,13 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set.")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
-app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.2.0")
+app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.3.0")
 app.include_router(notifications_router)
 
 TEMPERATURE       = 0.1
-MAX_TOKENS        = 350
+MAX_TOKENS        = 400
 SEED              = 42
-MAX_TOOL_ITERS    = 5
-CLASSIFIER_TOKENS = 80
+CLASSIFIER_TOKENS = 200
 CLASSIFIER_TEMP   = 0.0
 
 
@@ -83,8 +83,118 @@ class ServiceType(str, Enum):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Order Cart — server-side, never delegated to LLM
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class OrderItem:
+    name:       str
+    quantity:   int
+    unit_price: float
+    prep_notes: str  = ""
+
+    @property
+    def line_total(self) -> float:
+        return round(self.quantity * self.unit_price, 2)
+
+    def to_display(self) -> str:
+        note = f" ({self.prep_notes})" if self.prep_notes else ""
+        qty  = f"{self.quantity}x " if self.quantity > 1 else ""
+        return f"{qty}{self.name}{note} — ${self.line_total:.2f}"
+
+    def to_dict(self) -> dict:
+        return {
+            "name":       self.name,
+            "quantity":   self.quantity,
+            "unit_price": self.unit_price,
+            "prep_notes": self.prep_notes,
+            "line_total": self.line_total,
+        }
+
+
+@dataclass
+class OrderCart:
+    items:        list[OrderItem] = field(default_factory=list)
+    tax_rate:     float           = 0.0
+    delivery_fee: float           = 0.0
+
+    @property
+    def subtotal(self) -> float:
+        return round(sum(i.line_total for i in self.items), 2)
+
+    @property
+    def tax_total(self) -> float:
+        return round(self.subtotal * self.tax_rate, 2)
+
+    @property
+    def grand_total(self) -> float:
+        return round(self.subtotal + self.tax_total + self.delivery_fee, 2)
+
+    @property
+    def is_empty(self) -> bool:
+        return len(self.items) == 0
+
+    def add_item(self, name: str, quantity: int, unit_price: float, prep_notes: str = "") -> None:
+        # Check if item already exists (merge quantities)
+        for item in self.items:
+            if item.name.lower() == name.lower():
+                item.quantity   += quantity
+                if prep_notes:
+                    item.prep_notes = prep_notes
+                logger.info(f"[cart] updated {name} qty={item.quantity}")
+                return
+        self.items.append(OrderItem(name=name, quantity=quantity, unit_price=unit_price, prep_notes=prep_notes))
+        logger.info(f"[cart] added {name} x{quantity} @ ${unit_price}")
+
+    def remove_item(self, name: str) -> bool:
+        before = len(self.items)
+        self.items = [i for i in self.items if name.lower() not in i.name.lower()]
+        removed = len(self.items) < before
+        logger.info(f"[cart] remove '{name}' — removed={removed}")
+        return removed
+
+    def update_prep_notes(self, name: str, notes: str) -> bool:
+        for item in self.items:
+            if name.lower() in item.name.lower():
+                item.prep_notes = notes
+                logger.info(f"[cart] notes updated for '{name}': {notes}")
+                return True
+        return False
+
+    def update_quantity(self, name: str, quantity: int) -> bool:
+        for item in self.items:
+            if name.lower() in item.name.lower():
+                item.quantity = quantity
+                logger.info(f"[cart] qty updated for '{name}': {quantity}")
+                return True
+        return False
+
+    def to_summary_string(self) -> str:
+        """For order_summary field in DB — pipe separated."""
+        return " | ".join(
+            f"{i.name} (${i.unit_price:.2f})" + (f" [{i.prep_notes}]" if i.prep_notes else "")
+            for i in self.items
+        )
+
+    def to_display(self, lang: str = "en") -> str:
+        """Human-readable for LLM system prompt and confirmation."""
+        lines = [i.to_display() for i in self.items]
+        lines.append(f"\nSubtotal: ${self.subtotal:.2f}")
+        if self.tax_total > 0:
+            lines.append(f"Tax ({self.tax_rate*100:.0f}%): ${self.tax_total:.2f}")
+        if self.delivery_fee > 0:
+            lines.append(f"Delivery: ${self.delivery_fee:.2f}")
+        lines.append(f"Total: ${self.grand_total:.2f}")
+        return "\n".join(lines)
+
+    def to_list(self) -> list[dict]:
+        return [i.to_dict() for i in self.items]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Data models
 # ─────────────────────────────────────────────────────────────────────────────
+
 @dataclass
 class ServiceInfo:
     service_type: str
@@ -123,9 +233,6 @@ class CustomerData:
     address:           str = ""
     address_validated: bool = False
     email:             str = ""
-    order_items:       list[dict] = field(default_factory=list)
-    order_summary:     str = ""
-    order_total:       float = 0.0
     service_type:      str = ""
     delivery_fee:      float = 0.0
     order_number:      str = ""
@@ -137,6 +244,7 @@ class Session:
     session_id:         str
     tenant_id:          str
     tenant:             TenantContext
+    cart:               OrderCart     = field(default_factory=OrderCart)
     status:             State         = State.ORDER
     checkout_field:     CheckoutField = CheckoutField.ADDRESS
     collected:          CustomerData  = field(default_factory=CustomerData)
@@ -165,36 +273,24 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
     with engine.connect() as conn:
         row = conn.execute(text("""
             SELECT
-                t.id              AS tenant_id,
-                t.brand_name,
-                t.status,
-                t.physical_address,
-                t.city,
-                t.state,
-                t.country,
-                s.system_prompt,
-                s.primary_language,
-                s.supported_languages,
-                m.model_name,
-                m.api_key,
-                m.provider
+                t.id, t.brand_name, t.status,
+                t.physical_address, t.city, t.state, t.country,
+                s.system_prompt, s.primary_language, s.supported_languages,
+                m.model_name, m.api_key, m.provider
             FROM tenants t
             JOIN tenant_ai_settings s ON t.id = s.tenant_id
             JOIN llm_models m          ON s.model_id = m.id
             WHERE t.phone_number = :ph
         """), {"ph": to_number}).mappings().first()
-
         if not row:
             return None
-
         svc_rows = conn.execute(text("""
             SELECT service_type, is_active, fee_type, fee_amount, open_time, close_time
-            FROM tenant_services
-            WHERE tenant_id = :tid
-        """), {"tid": row["tenant_id"]}).mappings().all()
+            FROM tenant_services WHERE tenant_id = :tid
+        """), {"tid": row["id"]}).mappings().all()
 
     ctx = TenantContext(
-        tenant_id           = row["tenant_id"],
+        tenant_id           = row["id"],
         brand_name          = row["brand_name"],
         status              = row["status"],
         system_prompt       = row["system_prompt"],
@@ -227,13 +323,10 @@ def db_get_customer(from_number: str, tenant_id: str) -> dict:
             SELECT c.id AS customer_id, c.full_name, c.email,
                    tc.id AS tc_id, a.address_line_1
             FROM customers c
-            LEFT JOIN tenant_customers tc
-                ON c.id = tc.customer_id AND tc.tenant_id = :tid
-            LEFT JOIN tenant_customer_addresses a
-                ON tc.id = a.tenant_customer_id AND a.is_default = true
+            LEFT JOIN tenant_customers tc ON c.id = tc.customer_id AND tc.tenant_id = :tid
+            LEFT JOIN tenant_customer_addresses a ON tc.id = a.tenant_customer_id AND a.is_default = true
             WHERE c.phone_number = :ph
         """), {"tid": tenant_id, "ph": from_number}).mappings().first()
-
     if not row:
         return {"is_global": False, "is_tenant": False,
                 "full_name": "", "email": "", "address_line_1": "", "customer_id": None}
@@ -265,25 +358,20 @@ def db_save_customer(user_phone, tenant_id, full_name, address, email, order_sum
             ON CONFLICT (tenant_id, customer_id) DO NOTHING
             RETURNING id
         """), {"tid": tenant_id, "cid": customer_id}).fetchone()
-
         if not tc_row:
             tc_row = conn.execute(text("""
-                SELECT id FROM tenant_customers
-                WHERE tenant_id = :tid AND customer_id = :cid
+                SELECT id FROM tenant_customers WHERE tenant_id = :tid AND customer_id = :cid
             """), {"tid": tenant_id, "cid": customer_id}).fetchone()
         tc_id = tc_row[0]
 
         conn.execute(text("""
-            UPDATE tenant_customer_addresses SET is_default = false
-            WHERE tenant_customer_id = :tcid
+            UPDATE tenant_customer_addresses SET is_default = false WHERE tenant_customer_id = :tcid
         """), {"tcid": tc_id})
-
         conn.execute(text("""
             INSERT INTO tenant_customer_addresses
                 (id, tenant_customer_id, address_line_1, is_default, city, state)
             VALUES (gen_random_uuid(), :tcid, :addr, true, 'Toronto', 'ON')
         """), {"tcid": tc_id, "addr": address})
-
     logger.info(f"[db_save] customer_id={customer_id}")
     return str(customer_id)
 
@@ -300,79 +388,56 @@ def _generate_order_number(tenant_id: str) -> str:
     return f"{prefix}-{date_str}-{seq}"
 
 
-def db_save_order(
-    session_id:       str,
-    tenant_id:        str,
-    customer_id:      Optional[str],
-    customer_name:    str,
-    customer_phone:   str,
-    customer_email:   Optional[str],
-    service_type:     str,
-    delivery_address: str,
-    order_summary:    str,
-    order_total:      float,
-    delivery_fee:     float,
-    notes:            Optional[str] = None,
-) -> str:
+def db_save_order(session_id, tenant_id, customer_id, customer_name,
+                  customer_phone, customer_email, service_type,
+                  delivery_address, cart: OrderCart, notes=None) -> str:
     order_number = _generate_order_number(tenant_id)
-    grand_total  = order_total + delivery_fee
-
     with engine.begin() as conn:
         row = conn.execute(text("""
             INSERT INTO orders (
                 order_number, tenant_id, customer_id,
                 customer_name, customer_phone, customer_email,
                 service_type, delivery_address,
-                subtotal, tax_total, tip_total,
-                delivery_total, grand_total,
+                subtotal, tax_total, tip_total, delivery_total, grand_total,
                 notes, session_id
             ) VALUES (
-                :num, :tid, :cid,
-                :name, :phone, :email,
-                :stype, :addr,
-                :sub, 0, 0,
-                :del, :grand,
-                :notes, :sid
+                :num, :tid, :cid, :name, :phone, :email,
+                :stype, :addr, :sub, :tax, 0, :del, :grand, :notes, :sid
             ) RETURNING id
         """), {
-            "num": order_number, "tid": tenant_id, "cid": customer_id,
-            "name": customer_name, "phone": customer_phone,
-            "email": customer_email or None, "stype": service_type,
-            "addr": delivery_address or "",
-            "sub": round(order_total, 2), "del": round(delivery_fee, 2),
-            "grand": round(grand_total, 2), "notes": notes, "sid": session_id,
+            "num":   order_number, "tid": tenant_id, "cid": customer_id,
+            "name":  customer_name, "phone": customer_phone, "email": customer_email or None,
+            "stype": service_type, "addr": delivery_address or "",
+            "sub":   cart.subtotal, "tax": cart.tax_total,
+            "del":   cart.delivery_fee, "grand": cart.grand_total,
+            "notes": notes, "sid": session_id,
         }).fetchone()
         order_id = row[0]
 
-        _item_re = re.compile(r"([^|$\n]+?)\s*[\(\:]?\s*\$(\d+(?:\.\d{1,2})?)", re.IGNORECASE)
-        segments = [s.strip() for s in order_summary.split("|") if s.strip()]
-        if not segments:
-            segments = [order_summary.strip()]
-
-        for seg in segments:
-            if "?" in seg:
-                continue
-            m = _item_re.search(seg)
-            if m:
-                name  = m.group(1).strip().strip("(,.-").strip()
-                price = float(m.group(2))
-            else:
-                name  = seg.strip()
-                price = 0.0
-            if not name:
-                continue
+        for item in cart.items:
             conn.execute(text("""
-                INSERT INTO order_items (order_id, line_type, item_name, quantity, unit_price, line_total)
-                VALUES (:oid, 'item', :name, 1, :price, :price)
-            """), {"oid": order_id, "name": name, "price": round(price, 2)})
+                INSERT INTO order_items
+                    (order_id, line_type, item_name, quantity, unit_price, line_total, prep_notes)
+                VALUES (:oid, 'item', :name, :qty, :price, :total, :notes)
+            """), {
+                "oid": order_id, "name": item.name, "qty": item.quantity,
+                "price": item.unit_price, "total": item.line_total,
+                "notes": item.prep_notes or None,
+            })
 
-        if delivery_fee > 0:
+        if cart.delivery_fee > 0:
             conn.execute(text("""
                 INSERT INTO order_items (order_id, line_type, item_name, quantity, unit_price, line_total)
                 VALUES (:oid, 'delivery', 'Delivery fee', 1, :fee, :fee)
-            """), {"oid": order_id, "fee": round(delivery_fee, 2)})
+            """), {"oid": order_id, "fee": cart.delivery_fee})
 
-    logger.info(f"[db_save_order] order_number={order_number} grand_total={grand_total}")
+        if cart.tax_total > 0:
+            conn.execute(text("""
+                INSERT INTO order_items (order_id, line_type, item_name, quantity, unit_price, line_total)
+                VALUES (:oid, 'tax', 'Tax', 1, :tax, :tax)
+            """), {"oid": order_id, "tax": cart.tax_total})
+
+    logger.info(f"[db_save_order] order_number={order_number} grand_total={cart.grand_total}")
     return order_number
 
 
@@ -434,11 +499,9 @@ def _resolve_timezone_from_address(llm: LLMProvider, ctx: TenantContext) -> str:
 
 def _check_service_availability(ctx: TenantContext) -> None:
     try:
-        import zoneinfo
-        now = datetime.now(zoneinfo.ZoneInfo(ctx.timezone)).time()
+        now = datetime.now(zi.ZoneInfo(ctx.timezone)).time()
     except Exception:
         now = datetime.utcnow().time()
-
     for svc in ctx.services.values():
         if not svc.is_active:
             svc.is_open_now = False
@@ -489,11 +552,9 @@ async def validate_address_mapbox(address: str, city: str = "") -> dict:
                 f"https://api.mapbox.com/geocoding/v5/mapbox.places/{query}.json",
                 params={
                     "access_token": MAPBOX_TOKEN,
-                    "types":        "address",
-                    "limit":        3,
-                    "language":     "en",
-                    "country":      "ca,us",
-                    "proximity":    "-79.3832,43.6532",
+                    "types": "address", "limit": 3,
+                    "language": "en", "country": "ca,us",
+                    "proximity": "-79.3832,43.6532",
                 }
             )
         features = resp.json().get("features", [])
@@ -512,8 +573,56 @@ async def validate_address_mapbox(address: str, city: str = "") -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM Classifiers — now use LLMProvider interface
+# LLM Classifiers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_order_action(llm: LLMProvider, message: str, cart: OrderCart, menu_text: str) -> dict:
+    """
+    Uses LLM to extract structured order actions from customer message.
+    Returns a dict with action and items — server applies to cart.
+    """
+    cart_display = cart.to_display() if not cart.is_empty else "Empty cart"
+    prompt = f"""You are an order action extractor for a restaurant.
+
+Current cart:
+{cart_display}
+
+Menu (use EXACT names and prices from here):
+{menu_text[:3000]}
+
+Customer message: "{message}"
+
+Extract the action and reply with JSON ONLY. No explanation, no markdown, just JSON.
+
+{{
+  "action": "add|remove|modify|confirm|unclear|inquiry",
+  "items_to_add": [
+    {{"name": "exact item name from menu", "quantity": 1, "unit_price": 0.00, "prep_notes": "e.g. no sauce, extra spicy"}}
+  ],
+  "items_to_remove": ["exact item name"],
+  "items_to_modify": [
+    {{"name": "exact item name", "prep_notes": "new notes", "quantity": 0}}
+  ]
+}}
+
+Rules:
+- action "confirm" = customer says yes/ok/correct to their order summary
+- action "inquiry" = customer asks a question (hours, ingredients, availability)
+- action "unclear" = cannot determine intent
+- For quantity 0 in modify = keep existing quantity
+- prep_notes examples: "no curtido", "extra salsa", "sin picante", "well done"
+"""
+    try:
+        result = llm.classify(prompt, max_tokens=CLASSIFIER_TOKENS)
+        # Strip markdown if present
+        result = re.sub(r"```json|```", "", result).strip()
+        data   = json.loads(result)
+        logger.info(f"[cart_action] action={data.get('action')} add={len(data.get('items_to_add',[]))} remove={data.get('items_to_remove',[])}")
+        return data
+    except Exception as e:
+        logger.error(f"[extract_order_action] error: {e} raw={result if 'result' in dir() else 'N/A'}")
+        return {"action": "unclear", "items_to_add": [], "items_to_remove": [], "items_to_modify": []}
+
 
 def _classify_intent(llm: LLMProvider, message: str, context: str) -> str:
     prompt = (
@@ -528,7 +637,7 @@ def _classify_intent(llm: LLMProvider, message: str, context: str) -> str:
     )
     try:
         result = llm.classify(prompt).split()[0]
-        return result if result in ("provide_data", "back_to_order", "confirm", "cancel", "other") else "other"
+        return result if result in ("provide_data","back_to_order","confirm","cancel","other") else "other"
     except Exception as e:
         logger.error(f"[classify_intent] error: {e}")
         return "other"
@@ -544,7 +653,7 @@ def _classify_confirmation(llm: LLMProvider, message: str) -> str:
     )
     try:
         result = llm.classify(prompt).split()[0]
-        return result if result in ("yes", "no", "other") else "other"
+        return result if result in ("yes","no","other") else "other"
     except Exception as e:
         logger.error(f"[classify_confirm] error: {e}")
         return "other"
@@ -574,14 +683,14 @@ def _detect_language(message: str, supported: list[str]) -> str:
 
 def _is_affirmative(raw: str) -> bool:
     lowered = raw.strip().lower()
-    _YES    = {"yes","si","sí","yep","yeah","correct","ok","okay","sure","confirm",
-               "confirmed","adelante","procede","dale","claro","yup","perfecto",
-               "listo","va","órale","orale","all good","sounds good"}
+    _YES = {"yes","si","sí","yep","yeah","correct","ok","okay","sure","confirm",
+            "confirmed","adelante","procede","dale","claro","yup","perfecto",
+            "listo","va","órale","orale","all good","sounds good"}
     if lowered in _YES:
         return True
     _PHRASES = ("yes,","yes.","yes!","si,","si.","sí,","that's correct","looks good",
                 "all good","go ahead","todo bien","está bien","esta bien",
-                "todo correcto","confirmo","confirmar")
+                "todo correcto","confirmo","confirmar","that's everything","that's all")
     return any(p in lowered for p in _PHRASES)
 
 
@@ -604,59 +713,6 @@ def _extract_email(raw: str) -> str:
     return m.group(0) if m else ""
 
 
-_PRICE_RE    = re.compile(r"\$[\d]+\.[\d]{2}")
-_TOTAL_WORDS = ("total", "subtotal", "comes to", "that's", "grand total", "amount")
-
-
-def _detect_order_confirmation(llm_reply: str, customer_msg: str, conversation: list) -> tuple[bool, str, float]:
-    if not _is_affirmative(customer_msg):
-        return False, "", 0.0
-
-    def extract(text: str) -> tuple[list[str], float]:
-        lines, total = [], 0.0
-        for line in text.split("\n"):
-            stripped = line.strip().lstrip("*•-– ").strip()
-            if not stripped or len(stripped) < 4:
-                continue
-            if "?" in stripped:
-                continue
-            if any(w in stripped.lower() for w in _TOTAL_WORDS):
-                continue
-            if any(w in stripped.lower() for w in ("would you","anything else","shall i","want to add","how about","add anything")):
-                continue
-            prices = _PRICE_RE.findall(stripped)
-            if prices:
-                lines.append(stripped)
-                for p in prices:
-                    try:
-                        total += float(p.replace("$", ""))
-                    except ValueError:
-                        pass
-        return lines, total
-
-    lines, total = extract(llm_reply)
-    if lines:
-        return True, " | ".join(lines), total
-
-    for msg in reversed(conversation):
-        if msg.get("role") == "assistant" and msg.get("content") and "$" in msg["content"]:
-            lines, total = extract(msg["content"])
-            if lines:
-                return True, " | ".join(lines), total
-            break
-
-    return False, "", 0.0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# System prompt builder
-# ─────────────────────────────────────────────────────────────────────────────
-
-_LEGACY_RE = re.compile(
-    r"\[ORDER_FINALIZED\]|manage_customer_data\b|query_vector_database\b|STRICT PROTOCOL[\s\S]*",
-    re.IGNORECASE,
-)
-
 LANG_INSTRUCTIONS = {
     "en": "Respond ONLY in English. Never switch languages. Be warm and conversational.",
     "es": "Responde ÚNICAMENTE en español mexicano. Nunca cambies de idioma. Usa expresiones cálidas como '¡Con gusto!', '¡Claro que sí!'.",
@@ -664,6 +720,10 @@ LANG_INSTRUCTIONS = {
     "bn": "শুধুমাত্র বাংলায় উত্তর দিন। কখনো ভাষা পরিবর্তন করবেন না।",
 }
 
+_LEGACY_RE = re.compile(
+    r"\[ORDER_FINALIZED\]|manage_customer_data\b|query_vector_database\b|STRICT PROTOCOL[\s\S]*",
+    re.IGNORECASE,
+)
 
 def _clean_base_prompt(raw: str, brand: str) -> str:
     cleaned = _LEGACY_RE.sub("", raw).strip()
@@ -671,8 +731,12 @@ def _clean_base_prompt(raw: str, brand: str) -> str:
     cleaned = re.sub(r"Menu Context:[^\n]*", "", cleaned, flags=re.IGNORECASE).strip()
     return cleaned if len(cleaned) >= 20 else f"You are a professional ordering assistant for {brand}."
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# System prompt builder
+# ─────────────────────────────────────────────────────────────────────────────
+
 def build_system_prompt(session: "Session") -> str:
-    import zoneinfo as zi
     ctx  = session.tenant
     base = _clean_base_prompt(ctx.system_prompt, ctx.brand_name)
     c    = session.collected
@@ -680,33 +744,7 @@ def build_system_prompt(session: "Session") -> str:
     li   = f"IMPORTANT: {LANG_INSTRUCTIONS.get(lang, LANG_INSTRUCTIONS['en'])}\n\n"
 
     if session.status == State.ORDER:
-        cat_hint = ""
-        if ctx.menu_categories:
-            cats     = ", ".join(ctx.menu_categories[:6])
-            cat_hint = (
-                f"\n\nMenu sections available: {cats}. "
-                f"Mention section names when relevant. Give item details only if asked."
-            )
-        greeting = (
-            f"You are chatting with {c.full_name}, a returning customer. Greet them warmly by name. "
-            if (session.is_global_customer and c.full_name) else
-            "You are chatting with a new customer. Give a warm welcome greeting. "
-        )
-        avail = _get_available_services(ctx)
-        if not avail:
-            svc_note = (
-                "CRITICAL: We are CLOSED right now. Do NOT take orders or offer menu items. "
-                "Only tell the customer our operating hours and wish them well. "
-                "Do NOT offer to take orders for later. Do NOT ask if they want to place an order."
-            )
-        else:
-            svc_note = (
-                f"Available services: {', '.join(s.service_type for s in avail)}. "
-                f"Do NOT mention delivery, pickup, or fees at this stage — "
-                f"that comes ONLY after the customer has confirmed their food order."
-            )
-
-        # Build today's hours dynamically so LLM doesn't guess
+        # Today's day and time for accurate hours
         days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
         try:
             now_local  = datetime.now(zi.ZoneInfo(ctx.timezone))
@@ -719,33 +757,66 @@ def build_system_prompt(session: "Session") -> str:
         hours_note = ""
         if today_name:
             hours_note = (
-                f"\n\nToday is {today_name} and the current time is {today_time} "
-                f"({ctx.timezone}). "
-                f"If the customer asks about hours, refer ONLY to the HOURS section "
-                f"in the menu below for today's exact opening and closing times. "
-                f"Do NOT invent or guess hours."
+                f"\n\nToday is {today_name} and the current local time is {today_time}. "
+                f"If the customer asks about hours, refer ONLY to the HOURS section in the menu below "
+                f"for today's exact opening and closing times. Do NOT guess or invent hours."
+            )
+
+        # Current cart state for LLM context
+        cart_context = ""
+        if not session.cart.is_empty:
+            cart_context = (
+                f"\n\nCURRENT ORDER IN CART:\n{session.cart.to_display(lang)}\n"
+                f"The customer can add, remove, or modify items at any time."
+            )
+
+        cat_hint = ""
+        if ctx.menu_categories:
+            cats     = ", ".join(ctx.menu_categories[:6])
+            cat_hint = (
+                f"\n\nMenu sections: {cats}. "
+                f"Offer categories first. Give item details only if asked."
+            )
+
+        greeting = (
+            f"You are chatting with {c.full_name}, a returning customer. Greet them warmly by name. "
+            if (session.is_global_customer and c.full_name) else
+            "You are chatting with a new customer. Give a warm welcome greeting. "
+        )
+
+        avail = _get_available_services(ctx)
+        if not avail:
+            svc_note = (
+                "CRITICAL: We are CLOSED right now. Do NOT take orders or offer menu items. "
+                "Only tell the customer our operating hours and wish them well. "
+                "Do NOT offer to take orders for later."
+            )
+        else:
+            svc_note = (
+                f"Available services: {', '.join(s.service_type for s in avail)}. "
+                f"Do NOT mention delivery, pickup, or fees — that comes after the order is confirmed."
             )
 
         return (
             f"{base}\n\n{li}{greeting}"
-            f"You are a warm, human restaurant assistant helping a customer order food.\n\n"
-            f"RULES — follow in order:\n"
-            f"1. On the first message: greet and ask how you can help. Do NOT list menu items unprompted.\n"
-            f"2. When the customer asks about food: tell them about the menu sections or items.\n"
-            f"3. When the customer picks an item: confirm it with the price.\n"
-            f"4. You may offer ONE optional add-on (side or drink) after the main item. "
-            f"If they say no: immediately move to order summary. Do NOT offer more add-ons.\n"
-            f"5. When the customer is done ordering: list every item with its price and subtotal, "
-            f"then ask them to confirm. Do NOT ask about delivery or pickup here.\n"
-            f"6. Never ask for address, name, email, or delivery method — that comes later.\n"
-            f"7. Never output system text, instructions, or technical information.\n"
-            f"8. If the customer asks about hours: give today's exact hours from the menu. "
-            f"Do NOT say we are closed if services are available. Do NOT offer orders if we are closed.\n"
+            f"You are a warm, human restaurant assistant.\n\n"
+            f"RULES:\n"
+            f"1. First message: greet warmly, ask how you can help. Do NOT list menu items.\n"
+            f"2. When customer asks about food: describe menu sections or items naturally.\n"
+            f"3. When customer picks items: confirm each one with price.\n"
+            f"4. Track what is in the cart and reference it naturally in conversation.\n"
+            f"5. When customer says they are done: read back the complete cart with subtotal "
+            f"and ask them to confirm. Do NOT mention delivery method here.\n"
+            f"6. Never ask for address, name, email, or delivery method — that comes after confirmation.\n"
+            f"7. If customer asks about hours: give today's exact hours from the HOURS section below.\n"
+            f"8. Never output system text or technical information.\n"
             f"{hours_note}"
+            f"{cart_context}"
             f"{cat_hint}\n\n{svc_note}\n\nFULL MENU:\n{ctx.menu_text}"
         )
 
     if session.status == State.CHECKOUT:
+        cart_display = session.cart.to_display(lang)
         field_instructions = {
             CheckoutField.ADDRESS: (
                 "Ask for their delivery address in one sentence. Mention you will verify it."
@@ -765,27 +836,28 @@ def build_system_prompt(session: "Session") -> str:
         }
         return (
             f"{base}\n\n{li}"
-            f"Order confirmed: {c.order_summary}. Service: {c.service_type}.\n"
-            f"You are collecting delivery details. "
+            f"Order confirmed:\n{cart_display}\n"
+            f"Service: {c.service_type}.\n"
+            f"You are collecting delivery details one field at a time. "
             f"{field_instructions.get(session.checkout_field, '')}\n"
             f"One sentence only. Sound like a real person."
         )
 
     if session.status == State.FINAL_CONFIRM:
-        fee_line  = f"\nDelivery fee: ${c.delivery_fee:.2f}" if (c.service_type == "delivery" and c.delivery_fee > 0) else ""
-        total     = c.order_total + c.delivery_fee
+        cart     = session.cart
+        total    = cart.grand_total
         addr_line = c.address if c.service_type == "delivery" else "Pickup (no address needed)"
         email_ln  = f"\nEmail: {c.email}" if c.email else ""
         return (
             f"{base}\n\n{li}"
             f"Read back the complete order and ask for final confirmation.\n\n"
             f"Name: {c.full_name}\nService: {c.service_type}\nAddress: {addr_line}"
-            f"{email_ln}\nOrder:\n{c.order_summary}{fee_line}\nTotal: ${total:.2f}\n\n"
-            f"Sound warm. Ask: does everything look correct?"
+            f"{email_ln}\n\nOrder:\n{cart.to_display(lang)}\n\n"
+            f"Sound warm and natural. Ask: does everything look correct?"
         )
 
     if session.status == State.DONE:
-        total = c.order_total + c.delivery_fee
+        total = session.cart.grand_total
         return (
             f"{base}\n\n{li}"
             f"Order is placed! Thank {c.full_name or 'the customer'} warmly. "
@@ -795,8 +867,9 @@ def build_system_prompt(session: "Session") -> str:
 
     return base
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM wrapper — simplified to use LLMProvider
+# LLM call wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 
 def call_llm(llm: LLMProvider, messages: list) -> str:
@@ -832,7 +905,7 @@ async def chat_endpoint(request: ChatRequest):
     if ctx.status != "Active":
         raise HTTPException(403, "Restaurant is currently inactive.")
 
-    session = _sessions.get(user_phone)
+    session    = _sessions.get(user_phone)
     _GREETINGS = {"hello","hi","hola","hey","buenos dias","buenas","good morning",
                   "good afternoon","good evening","start","restart","nuevo","nueva",
                   "buenas tardes","buenas noches"}
@@ -848,7 +921,6 @@ async def chat_endpoint(request: ChatRequest):
         or is_greeting
     )
 
-    # ── Initialize provider from tenant config ─────────────────────────────
     llm = get_provider(ctx.provider, ctx.api_key, ctx.model_name)
 
     if need_new_session:
@@ -856,26 +928,26 @@ async def chat_endpoint(request: ChatRequest):
         _check_service_availability(ctx)
         ctx.menu_text       = get_full_menu(ctx.tenant_id)
         ctx.menu_categories = _extract_menu_categories(ctx.menu_text)
-        logger.info(f"[menu] categories={ctx.menu_categories}")
         cust = db_get_customer(user_phone, ctx.tenant_id)
         session = Session(
-            session_id          = str(uuid.uuid4()),
-            tenant_id           = ctx.tenant_id,
-            tenant              = ctx,
-            status              = State.ORDER,
-            language            = _detect_language(request.message, ctx.supported_languages),
-            collected           = CustomerData(
-                full_name   = cust["full_name"],
-                email       = cust["email"],
-                address     = cust["address_line_1"],
-                customer_id = cust["customer_id"],
+            session_id         = str(uuid.uuid4()),
+            tenant_id          = ctx.tenant_id,
+            tenant             = ctx,
+            cart               = OrderCart(),
+            status             = State.ORDER,
+            language           = _detect_language(request.message, ctx.supported_languages),
+            collected          = CustomerData(
+                full_name  = cust["full_name"],
+                email      = cust["email"],
+                address    = cust["address_line_1"],
+                customer_id= cust["customer_id"],
             ),
-            is_global_customer  = cust["is_global"],
-            is_tenant_customer  = cust["is_tenant"],
-            had_address         = bool(cust["address_line_1"]),
+            is_global_customer = cust["is_global"],
+            is_tenant_customer = cust["is_tenant"],
+            had_address        = bool(cust["address_line_1"]),
         )
         _sessions[user_phone] = session
-        logger.info(f"[session] new={session.session_id} provider={ctx.provider} tz={ctx.timezone} lang={session.language}")
+        logger.info(f"[session] new={session.session_id} provider={ctx.provider} tz={ctx.timezone}")
     else:
         _check_service_availability(session.tenant)
         detected = _detect_language(request.message, session.tenant.supported_languages)
@@ -903,24 +975,24 @@ async def chat_endpoint(request: ChatRequest):
         chose_delivery = any(w in msg_lower for w in delivery_kw)
 
         if chose_pickup and avail_pickup:
-            session.collected.service_type = "pickup"
-            session.collected.delivery_fee = 0.0
-            session.status                 = State.CHECKOUT
-            session.checkout_field         = CheckoutField.NAME if not session.collected.full_name else CheckoutField.EMAIL
+            session.collected.service_type  = "pickup"
+            session.collected.delivery_fee  = 0.0
+            session.cart.delivery_fee       = 0.0
+            session.status                  = State.CHECKOUT
+            session.checkout_field          = CheckoutField.NAME if not session.collected.full_name else CheckoutField.EMAIL
             final_reply = (
-                "¡Perfecto, pickup! 🏃 Sin costo de envío. ¿Me puedes dar tu nombre completo para la orden?"
+                "¡Perfecto, pickup! 🏃 Sin costo de envío. ¿Me puedes dar tu nombre completo?"
                 if session.language == "es" else
                 "Perfect, pickup it is! 🏃 No delivery fee. What's your full name for the order?"
             )
         elif chose_delivery and avail_delivery:
+            fee = avail_delivery.fee_amount if avail_delivery.fee_type == "fixed" else 0.0
             session.collected.service_type = "delivery"
-            session.collected.delivery_fee = avail_delivery.fee_amount if avail_delivery.fee_type == "fixed" else 0.0
+            session.collected.delivery_fee = fee
+            session.cart.delivery_fee      = fee
             session.status                 = State.CHECKOUT
             session.checkout_field         = CheckoutField.ADDRESS
-            fee_msg = (
-                f"${avail_delivery.fee_amount:.2f}" if avail_delivery.fee_amount > 0
-                else ("gratis" if session.language == "es" else "free")
-            )
+            fee_msg = f"${fee:.2f}" if fee > 0 else ("gratis" if session.language == "es" else "free")
             final_reply = (
                 f"¡Delivery! 🛵 Costo de envío: {fee_msg}. ¿Cuál es tu dirección de entrega?"
                 if session.language == "es" else
@@ -931,11 +1003,11 @@ async def chat_endpoint(request: ChatRequest):
                 [s for s in avail if s.service_type in ("pickup","delivery")], session.language
             )
             final_reply = (
-                (f"¿Cómo prefieres recibir tu pedido?\n\n{opts}" if opts else
-                 "Lo sentimos, no hay servicios disponibles ahora.")
+                (f"¿Cómo prefieres recibir tu pedido?\n\n{opts}" if opts
+                 else "Lo sentimos, no hay servicios disponibles ahora.")
                 if session.language == "es" else
-                (f"How would you like to receive your order?\n\n{opts}" if opts else
-                 "Sorry, no services are available right now.")
+                (f"How would you like to receive your order?\n\n{opts}" if opts
+                 else "Sorry, no services are available right now.")
             )
 
     elif session.status == State.CHECKOUT:
@@ -950,9 +1022,8 @@ async def chat_endpoint(request: ChatRequest):
             final_reply = ("¡Claro! " if session.language == "es" else "Of course! ") + strip_hallucinations(call_llm(llm, session.messages))
 
         elif intent == "cancel":
-            session.status                  = State.ORDER
-            session.collected.order_summary = ""
-            session.collected.order_total   = 0.0
+            session.status = State.ORDER
+            session.cart   = OrderCart()
             final_reply = (
                 "¡Sin problema! Empecemos de nuevo. ¿Qué te gustaría pedir?"
                 if session.language == "es" else
@@ -973,18 +1044,15 @@ async def chat_endpoint(request: ChatRequest):
                 else:
                     session.address_attempts += 1
                     sugg = "\n".join(f"• {s}" for s in result.get("suggestions",[])[:2])
-                    if sugg:
-                        final_reply = (
-                            f"Hmm, no pude encontrar esa dirección. ¿Quisiste decir?\n{sugg}\n\nO escríbela completa (número, calle, ciudad)."
-                            if session.language == "es" else
-                            f"Hmm, I couldn't find that address. Did you mean?\n{sugg}\n\nOr please re-enter it fully (number, street, city)."
-                        )
-                    else:
-                        final_reply = (
-                            "No encontré esa dirección. ¿Podrías escribirla completa? (número, calle, ciudad)"
-                            if session.language == "es" else
-                            "I couldn't find that address. Could you write it out fully? (number, street, city)"
-                        )
+                    final_reply = (
+                        f"Hmm, no pude encontrar esa dirección. ¿Quisiste decir?\n{sugg}\n\nO escríbela completa."
+                        if sugg and session.language == "es" else
+                        f"Hmm, I couldn't find that address. Did you mean?\n{sugg}\n\nOr please re-enter it fully."
+                        if sugg else
+                        ("No encontré esa dirección. ¿Podrías escribirla completa?"
+                         if session.language == "es" else
+                         "I couldn't find that address. Could you write it out fully?")
+                    )
 
             elif current_field == CheckoutField.NAME:
                 session.collected.full_name = _extract_name(request.message)
@@ -1008,7 +1076,8 @@ async def chat_endpoint(request: ChatRequest):
             try:
                 customer_id = db_save_customer(
                     user_phone, ctx.tenant_id, c.full_name,
-                    c.address or "Pickup", c.email or None, c.order_summary,
+                    c.address or "Pickup", c.email or None,
+                    session.cart.to_summary_string(),
                 )
                 session.collected.customer_id = customer_id
 
@@ -1021,9 +1090,7 @@ async def chat_endpoint(request: ChatRequest):
                     customer_email   = c.email or None,
                     service_type     = c.service_type,
                     delivery_address = c.address or "",
-                    order_summary    = c.order_summary,
-                    order_total      = c.order_total,
-                    delivery_fee     = c.delivery_fee,
+                    cart             = session.cart,
                 )
                 session.collected.order_number = order_number
                 session.status                 = State.DONE
@@ -1033,25 +1100,20 @@ async def chat_endpoint(request: ChatRequest):
                 # Send confirmation email
                 if c.email:
                     try:
-                        chat_api_url = os.getenv("CHAT_API_URL", "https://api.albertoescorcia.ca")
-                        total        = c.order_total + c.delivery_fee
                         async with httpx.AsyncClient(timeout=10.0) as http:
                             await http.post(
-                                f"{chat_api_url}/notifications/send-email",
+                                f"{os.getenv('CHAT_API_URL','https://api.albertoescorcia.ca')}/notifications/send-email",
                                 json={
-                                    "from_email":     os.getenv("FROM_EMAIL", "noreply@albertoescorcia.ca"),
-                                    "from_name":      os.getenv("FROM_NAME", "TenantOS"),
+                                    "from_email":     os.getenv("FROM_EMAIL","noreply@albertoescorcia.ca"),
+                                    "from_name":      os.getenv("FROM_NAME","TenantOS"),
                                     "to":             [{"email": c.email, "name": c.full_name}],
                                     "subject":        f"Your order at {ctx.brand_name} is confirmed!",
                                     "title":          f"Order confirmed, {c.full_name.split()[0]}!",
                                     "body":           (
-                                        f"Hi {c.full_name.split()[0]},\n\n"
-                                        f"Your order has been confirmed!\n\n"
-                                        f"Order: {c.order_summary}\n"
+                                        f"Hi {c.full_name.split()[0]},\n\nYour order has been confirmed!\n\n"
+                                        f"{session.cart.to_display()}\n\n"
                                         f"Service: {c.service_type}\n"
                                         f"{'Delivery to: ' + c.address + chr(10) if c.service_type == 'delivery' else ''}"
-                                        f"{'Delivery fee: $' + f'{c.delivery_fee:.2f}' + chr(10) if c.delivery_fee > 0 else ''}"
-                                        f"Total: ${total:.2f}\n\n"
                                         f"Reference: {order_number}\n\n"
                                         f"Thank you for ordering from {ctx.brand_name}!"
                                     ),
@@ -1059,13 +1121,13 @@ async def chat_endpoint(request: ChatRequest):
                                     "sender_address": ctx.physical_address,
                                 }
                             )
-                        logger.info(f"[email] confirmation sent to {c.email}")
+                        logger.info(f"[email] sent to {c.email}")
                     except Exception as e:
                         logger.error(f"[email] failed: {e}")
 
-                # Safety net closing message
-                total = c.order_total + c.delivery_fee
-                closing_bad = ("correct", "correcto", "look good", "everything", "todo", "?")
+                # Safety net closing
+                total = session.cart.grand_total
+                closing_bad = ("correct","correcto","look good","everything","todo","?")
                 if not final_reply or any(t in final_reply.lower() for t in closing_bad):
                     final_reply = (
                         f"¡Listo, {c.full_name}! Tu pedido está confirmado. "
@@ -1074,6 +1136,7 @@ async def chat_endpoint(request: ChatRequest):
                         f"You're all set, {c.full_name}! Order confirmed. "
                         f"Order: {order_number}. Total: ${total:.2f}. Thank you and enjoy your meal!"
                     )
+
             except Exception as e:
                 logger.error(f"[save] error: {e}")
                 session.status = State.FINAL_CONFIRM
@@ -1084,9 +1147,8 @@ async def chat_endpoint(request: ChatRequest):
                 )
 
         elif confirmation == "no":
-            session.status                  = State.ORDER
-            session.collected.order_summary = ""
-            session.collected.order_total   = 0.0
+            session.status = State.ORDER
+            session.cart   = OrderCart()
             final_reply = (
                 "¡Sin problema! Regresemos al pedido. ¿Qué cambios quieres hacer?"
                 if session.language == "es" else
@@ -1102,38 +1164,54 @@ async def chat_endpoint(request: ChatRequest):
             _refresh_system_prompt(session)
             final_reply = strip_hallucinations(call_llm(llm, session.messages))
         else:
-            for _ in range(MAX_TOOL_ITERS):
-                raw_reply = call_llm(llm, session.messages)
-                if not raw_reply:
-                    break
-                order_confirmed, order_summary, order_total = _detect_order_confirmation(
-                    raw_reply, request.message, session.messages
-                )
-                final_reply = strip_hallucinations(raw_reply)
+            # Extract structured action from customer message
+            action = _extract_order_action(llm, request.message, session.cart, ctx.menu_text)
 
-                if order_confirmed and order_summary:
-                    session.collected.order_summary = order_summary
-                    session.collected.order_total   = order_total
-                    session.status                  = State.SERVICE_SELECT
-                    logger.info(f"[order] confirmed total=${order_total}")
-                    avail_user = [s for s in avail if s.service_type in ("pickup","delivery")]
-                    opts       = _format_service_options(avail_user, session.language)
-                    final_reply = (
-                        (f"¡Perfecto! 🎉 ¿Cómo prefieres recibir tu pedido?\n\n{opts}" if opts else
-                         "Lo sentimos, no hay pickup ni delivery disponibles ahora.")
-                        if session.language == "es" else
-                        (f"Perfect! 🎉 How would you like to receive your order?\n\n{opts}" if opts else
-                         "Sorry, pickup and delivery are not available right now.")
+            if action["action"] == "add":
+                for item_data in action.get("items_to_add", []):
+                    session.cart.add_item(
+                        name       = item_data.get("name",""),
+                        quantity   = int(item_data.get("quantity", 1)),
+                        unit_price = float(item_data.get("unit_price", 0)),
+                        prep_notes = item_data.get("prep_notes",""),
                     )
-                    session.messages.append({"role": "assistant", "content": final_reply})
-                    return _response(session, final_reply)
-                break
 
+            elif action["action"] == "remove":
+                for name in action.get("items_to_remove", []):
+                    session.cart.remove_item(name)
+
+            elif action["action"] == "modify":
+                for mod in action.get("items_to_modify", []):
+                    if mod.get("prep_notes"):
+                        session.cart.update_prep_notes(mod["name"], mod["prep_notes"])
+                    if mod.get("quantity", 0) > 0:
+                        session.cart.update_quantity(mod["name"], mod["quantity"])
+
+            elif action["action"] == "confirm" and not session.cart.is_empty:
+                # Customer confirmed the order — move to service selection
+                session.status = State.SERVICE_SELECT
+                logger.info(f"[order] confirmed cart subtotal=${session.cart.subtotal} items={len(session.cart.items)}")
+                avail_user = [s for s in avail if s.service_type in ("pickup","delivery")]
+                opts       = _format_service_options(avail_user, session.language)
+                final_reply = (
+                    (f"¡Perfecto! 🎉 ¿Cómo prefieres recibir tu pedido?\n\n{opts}" if opts
+                     else "Lo sentimos, no hay pickup ni delivery disponibles ahora.")
+                    if session.language == "es" else
+                    (f"Perfect! 🎉 How would you like to receive your order?\n\n{opts}" if opts
+                     else "Sorry, pickup and delivery are not available right now.")
+                )
+                session.messages.append({"role": "assistant", "content": final_reply})
+                return _response(session, final_reply)
+
+            # Refresh prompt with updated cart and get LLM reply
+            _refresh_system_prompt(session)
+            final_reply = strip_hallucinations(call_llm(llm, session.messages))
             if not final_reply:
                 final_reply = (
                     "¿Qué te gustaría ordenar?" if session.language == "es"
                     else "What would you like to order?"
                 )
+
     else:
         c = session.collected
         final_reply = (
@@ -1158,19 +1236,21 @@ def _response(session: Session, reply: str) -> dict:
         "status":     session.status.value,
         "language":   session.language,
         "provider":   session.tenant.provider,
+        "cart":       session.cart.to_list(),
+        "cart_total": session.cart.grand_total,
         "debug": {
-            "checkout_field": session.checkout_field.value,
-            "service_type":   c.service_type,
-            "address_valid":  c.address_validated,
-            "order_total":    c.order_total,
-            "delivery_fee":   c.delivery_fee,
-            "order_number":   c.order_number,
+            "checkout_field":  session.checkout_field.value,
+            "service_type":    c.service_type,
+            "address_valid":   c.address_validated,
+            "order_number":    c.order_number,
+            "cart_items":      len(session.cart.items),
+            "cart_subtotal":   session.cart.subtotal,
+            "delivery_fee":    session.cart.delivery_fee,
             "collected": {
-                "full_name":     c.full_name,
-                "address":       c.address,
-                "email":         c.email,
-                "order_summary": c.order_summary,
-                "customer_id":   c.customer_id,
+                "full_name":  c.full_name,
+                "address":    c.address,
+                "email":      c.email,
+                "customer_id": c.customer_id,
             },
             "tenant_tz":     session.tenant.timezone,
             "services_open": [s.service_type for s in _get_available_services(session.tenant)],
@@ -1204,14 +1284,14 @@ async def get_session(from_number: str):
         "provider":       session.tenant.provider,
         "checkout_field": session.checkout_field.value,
         "service_type":   session.collected.service_type,
+        "cart":           session.cart.to_list(),
+        "cart_subtotal":  session.cart.subtotal,
+        "cart_total":     session.cart.grand_total,
         "collected": {
-            "full_name":     session.collected.full_name,
-            "address":       session.collected.address,
-            "email":         session.collected.email,
-            "order_summary": session.collected.order_summary,
-            "order_total":   session.collected.order_total,
-            "delivery_fee":  session.collected.delivery_fee,
-            "order_number":  session.collected.order_number,
+            "full_name":    session.collected.full_name,
+            "address":      session.collected.address,
+            "email":        session.collected.email,
+            "order_number": session.collected.order_number,
         },
         "tenant_tz":     session.tenant.timezone,
         "services_open": [s.service_type for s in _get_available_services(session.tenant)],
