@@ -1,24 +1,33 @@
 """
-SaaS Restaurant Multi-Tenant Chat API — v4.9
-=============================================
-Changes from v4.8:
-  - Channel awareness: Session and ChatRequest now carry a `channel` field
-    ("chat" | "voice"). Defaults to "chat" so existing integrations keep
-    working unchanged.
-  - All deterministic replies pass through _voice_safe(): when channel is
-    "voice", emojis, asterisks, markdown bullets, and headers are stripped
-    so TTS engines read them cleanly.
-  - Reply language rewritten to sound like a real person talking, not a
-    form. No more "Reply X to do Y" — the classifier already understands
-    natural responses like "sure", "dale", "no thanks", "skip", etc.
-  - Future: when channel="voice" is set, order_number will be spelled out
-    digit-by-digit for TTS. Currently emitted raw on both channels.
+SaaS Restaurant Multi-Tenant Chat API — v4.11
+==============================================
+ALBERTO
+Changes from v4.10:
+  - ORDER AUDITING:
+    * `orders.payment_method` (card | interac | e_transfer | cash) with a
+      database-level constraint enforcing "cash only on pickup orders".
+    * `orders.payment_status` (pending | paid | failed | refunded).
+    * Timestamps for the full lifecycle: paid_at, prepared_at,
+      out_for_delivery_at, delivered_at, cancelled_at + cancellation_reason.
+    * `orders.status` now uses a strict workflow: pending → confirmed →
+      preparing → ready → out_for_delivery → delivered (or cancelled).
+  - TAX PER-ITEM saved on order_items: is_tax_exempt, tax_rate, tax_amount.
+    The aggregated 'tax' line_type row is kept for backward compatibility.
+  - REPORTING ENDPOINTS:
+    * GET    /orders/{order_number}                   — full order detail
+    * GET    /tenants/{tenant_id}/orders              — list with filters
+    * GET    /tenants/{tenant_id}/orders/today        — today's snapshot
+    * PATCH  /orders/{order_number}/status            — update workflow status
+    * PATCH  /orders/{order_number}/payment           — set method/status/paid_at
+    * POST   /orders/{order_number}/cancel            — cancel with reason
+  - Required migration: migration_v4.11.sql
 """
 
 import os
 import re
 import uuid
 import json
+import math
 import logging
 import httpx
 import zoneinfo as zi
@@ -53,7 +62,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set.")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
-app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.9.0")
+app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.11.0")
 app.include_router(notifications_router)
 
 TEMPERATURE       = 0.1
@@ -101,45 +110,81 @@ class ServiceType(str, Enum):
 
 @dataclass
 class OrderItem:
-    name:       str
-    quantity:   int
-    unit_price: float
-    prep_notes: str = ""
-    item_code:  str = ""
+    name:              str
+    quantity:          int
+    unit_price:        float
+    prep_notes:        str   = ""
+    item_code:         str   = ""
+    name_plural:       str   = ""        # Optional plural form for display
+    is_tax_exempt:     bool  = False
+    tax_rate_override: Optional[float] = None   # None → use tenant default
 
     @property
     def line_total(self) -> float:
         return round(self.quantity * self.unit_price, 2)
 
+    def effective_tax_rate(self, tenant_default_rate: float) -> float:
+        """Returns the tax rate that actually applies to this line."""
+        if self.is_tax_exempt:
+            return 0.0
+        if self.tax_rate_override is not None:
+            return float(self.tax_rate_override)
+        return float(tenant_default_rate or 0.0)
+
+    def display_name(self, lang_plural: str = "") -> str:
+        """
+        Pick the right form for the customer-facing display.
+        - For quantity == 1: use singular `name`.
+        - For quantity > 1: use language-aware plural if available, else
+          fall back to base name (no language-specific guessing).
+        """
+        if self.quantity <= 1:
+            return self.name
+        if lang_plural:
+            return lang_plural
+        if self.name_plural:
+            return self.name_plural
+        return self.name
+
     def to_display(self) -> str:
         note = f" ({self.prep_notes})" if self.prep_notes else ""
         qty  = f"{self.quantity}x " if self.quantity > 1 else ""
-        return f"{qty}{self.name}{note} — ${self.line_total:.2f}"
+        return f"{qty}{self.display_name()}{note} — ${self.line_total:.2f}"
 
     def to_dict(self) -> dict:
         return {
-            "item_code":  self.item_code,
-            "name":       self.name,
-            "quantity":   self.quantity,
-            "unit_price": self.unit_price,
-            "prep_notes": self.prep_notes,
-            "line_total": self.line_total,
+            "item_code":         self.item_code,
+            "name":              self.name,
+            "name_plural":       self.name_plural,
+            "quantity":          self.quantity,
+            "unit_price":        self.unit_price,
+            "prep_notes":        self.prep_notes,
+            "line_total":        self.line_total,
+            "is_tax_exempt":     self.is_tax_exempt,
+            "tax_rate_override": self.tax_rate_override,
         }
 
 
 @dataclass
 class OrderCart:
-    items:        list[OrderItem] = field(default_factory=list)
-    tax_rate:     float           = 0.0
-    delivery_fee: float           = 0.0
+    items:               list[OrderItem] = field(default_factory=list)
+    tenant_default_tax:  float           = 0.0
+    delivery_fee:        float           = 0.0
 
     @property
     def subtotal(self) -> float:
+        """Sum of line totals (pre-tax)."""
         return round(sum(i.line_total for i in self.items), 2)
 
     @property
     def tax_total(self) -> float:
-        return round(self.subtotal * self.tax_rate, 2)
+        """Tax computed per-item using each item's effective rate."""
+        total = 0.0
+        for i in self.items:
+            rate = i.effective_tax_rate(self.tenant_default_tax)
+            if rate > 0:
+                total += i.line_total * rate
+        return round(total, 2)
 
     @property
     def grand_total(self) -> float:
@@ -150,7 +195,9 @@ class OrderCart:
         return len(self.items) == 0
 
     def add_item(self, name: str, quantity: int, unit_price: float,
-                 prep_notes: str = "", item_code: str = "") -> None:
+                 prep_notes: str = "", item_code: str = "",
+                 name_plural: str = "", is_tax_exempt: bool = False,
+                 tax_rate_override: Optional[float] = None) -> None:
         for item in self.items:
             if item.name.lower() == name.lower():
                 item.quantity += quantity
@@ -161,10 +208,19 @@ class OrderCart:
                 logger.info(f"[cart] updated {name} qty={item.quantity}")
                 return
         self.items.append(OrderItem(
-            name=name, quantity=quantity, unit_price=unit_price,
-            prep_notes=prep_notes, item_code=item_code
+            name              = name,
+            quantity          = quantity,
+            unit_price        = unit_price,
+            prep_notes        = prep_notes,
+            item_code         = item_code,
+            name_plural       = name_plural,
+            is_tax_exempt     = is_tax_exempt,
+            tax_rate_override = tax_rate_override,
         ))
-        logger.info(f"[cart] added {name} x{quantity} @ ${unit_price} code={item_code}")
+        logger.info(
+            f"[cart] added {name} x{quantity} @ ${unit_price} code={item_code} "
+            f"tax_exempt={is_tax_exempt} override={tax_rate_override}"
+        )
 
     def remove_item(self, name: str) -> bool:
         before = len(self.items)
@@ -194,13 +250,16 @@ class OrderCart:
         )
 
     def to_display(self, lang: str = "en") -> str:
+        """
+        Customer-facing cart display during ORDER state.
+        Shows items + subtotal ONLY. Tax is intentionally NOT shown here —
+        it's revealed at FINAL_CONFIRM.
+        Delivery fee shown only if > 0 (it's known after service selection).
+        """
         lines = [i.to_display() for i in self.items]
         lines.append(f"\nSubtotal: ${self.subtotal:.2f}")
-        if self.tax_total > 0:
-            lines.append(f"Tax ({self.tax_rate*100:.0f}%): ${self.tax_total:.2f}")
         if self.delivery_fee > 0:
             lines.append(f"Delivery: ${self.delivery_fee:.2f}")
-        lines.append(f"Total: ${self.grand_total:.2f}")
         return "\n".join(lines)
 
     def to_list(self) -> list[dict]:
@@ -213,12 +272,13 @@ class OrderCart:
 
 @dataclass
 class ServiceInfo:
-    service_type: str
-    is_active:    bool
-    fee_type:     str
-    fee_amount:   float
-    is_open_now:  bool = False
-    hours_by_day: dict = field(default_factory=dict)
+    service_type:       str
+    is_active:          bool
+    fee_type:           str
+    fee_amount:         float
+    is_open_now:        bool  = False
+    hours_by_day:       dict  = field(default_factory=dict)
+    delivery_radius_km: Optional[float] = None   # only meaningful for delivery
 
 
 @dataclass
@@ -234,12 +294,13 @@ class TenantContext:
     city:                str
     state:               str
     country:             str
-    provider:            str = "groq"
-    primary_language:    str = "en"
+    provider:            str   = "groq"
+    primary_language:    str   = "en"
     supported_languages: list[str] = field(default_factory=lambda: ["en"])
     services:            dict[str, ServiceInfo] = field(default_factory=dict)
-    menu_text:           str = ""
+    menu_text:           str   = ""
     menu_categories:     list[str] = field(default_factory=list)
+    default_tax_rate:    float = 0.0   # e.g. 0.13 for Ontario HST
 
 
 @dataclass
@@ -335,6 +396,7 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
             SELECT
                 t.id, t.brand_name, t.status,
                 t.physical_address, t.city, t.state, t.country, t.timezone,
+                COALESCE(t.default_tax_rate, 0) AS default_tax_rate,
                 s.system_prompt, s.primary_language, s.supported_languages,
                 m.model_name, m.api_key, m.provider
             FROM tenants t
@@ -347,6 +409,7 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
 
         svc_rows = conn.execute(text("""
             SELECT service_type, is_active, fee_type, fee_amount,
+                   delivery_radius_km,
                    monday_open, monday_close,
                    tuesday_open, tuesday_close,
                    wednesday_open, wednesday_close,
@@ -372,6 +435,7 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
         country             = row["country"] or "",
         primary_language    = row["primary_language"] or "en",
         supported_languages = [l.strip() for l in (row["supported_languages"] or "en").split(",")],
+        default_tax_rate    = float(row["default_tax_rate"] or 0),
     )
     for s in svc_rows:
         hours = {
@@ -379,11 +443,12 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
             for day in _DAYS
         }
         ctx.services[s["service_type"]] = ServiceInfo(
-            service_type = s["service_type"],
-            is_active    = s["is_active"],
-            fee_type     = s["fee_type"],
-            fee_amount   = float(s["fee_amount"] or 0),
-            hours_by_day = hours,
+            service_type       = s["service_type"],
+            is_active          = s["is_active"],
+            fee_type           = s["fee_type"],
+            fee_amount         = float(s["fee_amount"] or 0),
+            hours_by_day       = hours,
+            delivery_radius_km = float(s["delivery_radius_km"]) if s.get("delivery_radius_km") is not None else None,
         )
     return ctx
 
@@ -463,6 +528,13 @@ def _generate_order_number(tenant_id: str) -> str:
 def db_save_order(session_id, tenant_id, customer_id, customer_name,
                   customer_phone, customer_email, service_type,
                   delivery_address, cart: OrderCart, notes=None) -> str:
+    """
+    Persists the order with full audit trail:
+      - orders.status starts at 'confirmed' (customer accepted summary).
+      - orders.payment_status starts at 'pending' (payment not yet processed).
+      - Each order_items row carries its own tax_rate/tax_amount when applicable.
+      - The aggregated 'tax' line is kept for backward compatibility.
+    """
     order_number = _generate_order_number(tenant_id)
     with engine.begin() as conn:
         row = conn.execute(text("""
@@ -471,10 +543,11 @@ def db_save_order(session_id, tenant_id, customer_id, customer_name,
                 customer_name, customer_phone, customer_email,
                 service_type, delivery_address,
                 subtotal, tax_total, tip_total, delivery_total, grand_total,
-                notes, session_id
+                notes, session_id, status, payment_status
             ) VALUES (
                 :num, :tid, :cid, :name, :phone, :email,
-                :stype, :addr, :sub, :tax, 0, :del, :grand, :notes, :sid
+                :stype, :addr, :sub, :tax, 0, :del, :grand, :notes, :sid,
+                'confirmed', 'pending'
             ) RETURNING id
         """), {
             "num": order_number, "tid": tenant_id, "cid": customer_id,
@@ -487,31 +560,50 @@ def db_save_order(session_id, tenant_id, customer_id, customer_name,
         }).fetchone()
         order_id = row[0]
 
+        # Per-item rows with effective tax info
         for item in cart.items:
+            eff_rate   = item.effective_tax_rate(cart.tenant_default_tax)
+            tax_amount = round(item.line_total * eff_rate, 2) if eff_rate > 0 else 0.0
             conn.execute(text("""
-                INSERT INTO order_items
-                    (order_id, line_type, item_code, item_name, quantity, unit_price, line_total, prep_notes)
-                VALUES (:oid, 'item', :code, :name, :qty, :price, :total, :notes)
+                INSERT INTO order_items (
+                    order_id, line_type, item_code, item_name,
+                    quantity, unit_price, line_total, prep_notes,
+                    is_tax_exempt, tax_rate, tax_amount
+                ) VALUES (
+                    :oid, 'item', :code, :name,
+                    :qty, :price, :total, :notes,
+                    :exempt, :rate, :tamt
+                )
             """), {
                 "oid": order_id, "code": item.item_code or None,
                 "name": item.name, "qty": item.quantity,
                 "price": item.unit_price, "total": item.line_total,
                 "notes": item.prep_notes or None,
+                "exempt": item.is_tax_exempt,
+                "rate":   eff_rate if eff_rate > 0 else None,
+                "tamt":   tax_amount if tax_amount > 0 else None,
             })
 
+        # Delivery line (kept as before — convenient for invoice rendering)
         if cart.delivery_fee > 0:
             conn.execute(text("""
                 INSERT INTO order_items (order_id, line_type, item_name, quantity, unit_price, line_total)
                 VALUES (:oid, 'delivery', 'Delivery fee', 1, :fee, :fee)
             """), {"oid": order_id, "fee": cart.delivery_fee})
 
+        # Aggregated tax line (kept for backward compatibility with existing reports)
         if cart.tax_total > 0:
             conn.execute(text("""
                 INSERT INTO order_items (order_id, line_type, item_name, quantity, unit_price, line_total)
                 VALUES (:oid, 'tax', 'Tax', 1, :tax, :tax)
             """), {"oid": order_id, "tax": cart.tax_total})
 
-    logger.info(f"[db_save_order] order_number={order_number} grand_total={cart.grand_total}")
+    logger.info(
+        f"[db_save_order] order_number={order_number} "
+        f"subtotal=${cart.subtotal} tax=${cart.tax_total} "
+        f"delivery=${cart.delivery_fee} grand_total=${cart.grand_total} "
+        f"items={len(cart.items)}"
+    )
     return order_number
 
 
@@ -571,6 +663,27 @@ def get_menu_for_language(tenant_id: str, language: str) -> str:
         return "Menu information could not be retrieved."
 
 
+def lookup_translated_plural(tenant_id: str, item_code: str, language: str) -> str:
+    """
+    Returns the language-specific plural form if available, else empty string.
+    Falls back to menu_items.name_plural is handled by OrderItem.display_name().
+    """
+    if not item_code or not language:
+        return ""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT name_plural
+                FROM menu_item_translations
+                WHERE tenant_id = :tid AND item_code = :code AND language_code = :lang
+                LIMIT 1
+            """), {"tid": tenant_id, "code": item_code, "lang": language}).fetchone()
+        return (row[0] or "") if row else ""
+    except Exception as e:
+        logger.error(f"[lookup_translated_plural] error: {e}")
+        return ""
+
+
 def get_menu_categories(tenant_id: str) -> list[str]:
     try:
         with engine.connect() as conn:
@@ -593,7 +706,8 @@ def lookup_menu_item(tenant_id: str, item_name: str) -> Optional[dict]:
     try:
         with engine.connect() as conn:
             row = conn.execute(text("""
-                SELECT item_code, name, price
+                SELECT item_code, name, name_plural, price,
+                       is_tax_exempt, tax_rate_override
                 FROM menu_items
                 WHERE tenant_id = :tid
                     AND is_available = true
@@ -808,6 +922,18 @@ async def _geocode_tenant_proximity(ctx: TenantContext) -> str:
     return proximity
 
 
+def _haversine_km(lng1: float, lat1: float, lng2: float, lat2: float) -> float:
+    """Great-circle distance in kilometers between two lng/lat points."""
+    R = 6371.0  # Earth radius in km
+    phi1   = math.radians(lat1)
+    phi2   = math.radians(lat2)
+    dphi   = math.radians(lat2 - lat1)
+    dlamb  = math.radians(lng2 - lng1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlamb/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
 def _country_to_mapbox_code(country: str) -> str:
     """Convert country name to comma-separated Mapbox country codes."""
     mapping = {
@@ -818,22 +944,25 @@ def _country_to_mapbox_code(country: str) -> str:
         "Colombia": "co",
     }
     code = mapping.get(country, "")
-    # Default: tenant country + neighbours for cross-border deliveries
     if code == "ca": return "ca,us"
     if code == "us": return "us,ca"
     if code: return code
-    return "ca,us"  # safe default
+    return "ca,us"
 
 
 async def validate_address_mapbox(address: str, ctx: TenantContext) -> dict:
     """
     Validates an address using Mapbox geocoding, biased to the tenant's location.
-    Threshold is MAPBOX_THRESHOLD (currently 0.5).
+    Threshold is MAPBOX_THRESHOLD. If a delivery_radius_km is configured on
+    the delivery service, also checks that the address is within that radius.
+
+    Returns dict with: valid, canonical, suggestions, relevance,
+    out_of_zone (bool), distance_km (float|None).
     """
     if not MAPBOX_TOKEN:
-        return {"valid": True, "canonical": address, "suggestions": [], "relevance": 1.0}
+        return {"valid": True, "canonical": address, "suggestions": [],
+                "relevance": 1.0, "out_of_zone": False, "distance_km": None}
 
-    # Build query with tenant city/state for better matching
     parts = [address]
     if ctx.city:    parts.append(ctx.city)
     if ctx.state:   parts.append(ctx.state)
@@ -862,21 +991,57 @@ async def validate_address_mapbox(address: str, ctx: TenantContext) -> dict:
         logger.info(f"[mapbox] query='{query}' results={len(features)}")
 
         if not features:
-            return {"valid": False, "canonical": "", "suggestions": [], "relevance": 0.0}
+            return {"valid": False, "canonical": "", "suggestions": [],
+                    "relevance": 0.0, "out_of_zone": False, "distance_km": None}
 
-        top = features[0]
+        top       = features[0]
         relevance = top.get("relevance", 0)
-        logger.info(f"[mapbox] top relevance={relevance} place={top.get('place_name','')[:80]}")
+        canonical = top.get("place_name", address)
+        center    = top.get("center", [None, None])
+        addr_lng, addr_lat = center if len(center) == 2 else (None, None)
+
+        logger.info(f"[mapbox] top relevance={relevance} place={canonical[:80]}")
+
+        if relevance < MAPBOX_THRESHOLD:
+            return {
+                "valid":       False,
+                "canonical":   canonical,
+                "suggestions": [f["place_name"] for f in features[:3]],
+                "relevance":   relevance,
+                "out_of_zone": False,
+                "distance_km": None,
+            }
+
+        # Address found — now check delivery radius if configured
+        distance_km = None
+        out_of_zone = False
+        delivery_svc = ctx.services.get("delivery")
+        radius = delivery_svc.delivery_radius_km if delivery_svc else None
+
+        if radius and radius > 0 and proximity and addr_lng is not None:
+            try:
+                t_lng, t_lat = [float(x) for x in proximity.split(",")]
+                distance_km  = round(_haversine_km(t_lng, t_lat, addr_lng, addr_lat), 2)
+                out_of_zone  = distance_km > radius
+                logger.info(
+                    f"[mapbox_radius] distance={distance_km}km radius={radius}km "
+                    f"out_of_zone={out_of_zone}"
+                )
+            except Exception as e:
+                logger.error(f"[mapbox_radius] error: {e}")
 
         return {
-            "valid":       relevance >= MAPBOX_THRESHOLD,
-            "canonical":   top.get("place_name", address),
+            "valid":       not out_of_zone,
+            "canonical":   canonical,
             "suggestions": [f["place_name"] for f in features[:3]],
             "relevance":   relevance,
+            "out_of_zone": out_of_zone,
+            "distance_km": distance_km,
         }
     except Exception as e:
         logger.error(f"[mapbox] Error: {e}")
-        return {"valid": True, "canonical": address, "suggestions": [], "relevance": 0.0}
+        return {"valid": True, "canonical": address, "suggestions": [],
+                "relevance": 0.0, "out_of_zone": False, "distance_km": None}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1103,31 +1268,33 @@ def _build_final_confirm_summary(session: "Session") -> str:
     """
     Builds a complete, deterministic order summary in conversational language.
     NO LLM involved. Uses exact cart totals and Mapbox-normalized address.
+    Tax is revealed here (not during the ORDER state).
     Channel-aware via _voice_safe() at the call site.
     """
     c    = session.collected
     lang = session.language
     cart = session.cart
 
-    # Items as natural prose ("three pupusas revueltas, one pupusa de queso with no onions, and a tamarindo")
+    # Natural prose listing using each item's lang-aware plural form
     def _natural_items(items, lang):
         parts = []
         for it in items:
             qty = it.quantity
-            name = it.name
+            display = it.display_name()  # already plural-aware when qty>1
             if qty == 1:
-                qty_word = "una" if lang == "es" else "a"
-                # Heuristic: use "a" for items starting with consonant, "an" for vowel (English only)
-                if lang == "en" and name and name[0].lower() in "aeiou":
-                    qty_word = "an"
-                part = f"{qty_word} {name}"
+                if lang == "es":
+                    prefix = "una" if display and display[0].lower() in "aeiouáéíóú" else "un"
+                    part = f"{prefix} {display}"
+                else:
+                    prefix = "an" if display and display[0].lower() in "aeiou" else "a"
+                    part = f"{prefix} {display}"
             else:
-                part = f"{qty} {name}"
+                part = f"{qty} {display}"
             if it.prep_notes:
                 connector = " con " if lang == "es" else " with "
                 part += f"{connector}{it.prep_notes}"
             parts.append(part)
-        if len(parts) == 0:
+        if not parts:
             return ""
         if len(parts) == 1:
             return parts[0]
@@ -1139,6 +1306,24 @@ def _build_final_confirm_summary(session: "Session") -> str:
 
     items_prose = _natural_items(cart.items, lang)
 
+    # Breakdown lines (subtotal, tax, delivery, total)
+    if lang == "es":
+        breakdown_lines = [f"Subtotal: ${cart.subtotal:.2f}"]
+        if cart.tax_total > 0:
+            breakdown_lines.append(f"Impuestos: ${cart.tax_total:.2f}")
+        if cart.delivery_fee > 0:
+            breakdown_lines.append(f"Envío: ${cart.delivery_fee:.2f}")
+        breakdown_lines.append(f"Total: ${cart.grand_total:.2f}")
+        breakdown = ". ".join(breakdown_lines)
+    else:
+        breakdown_lines = [f"Subtotal ${cart.subtotal:.2f}"]
+        if cart.tax_total > 0:
+            breakdown_lines.append(f"tax ${cart.tax_total:.2f}")
+        if cart.delivery_fee > 0:
+            breakdown_lines.append(f"delivery ${cart.delivery_fee:.2f}")
+        breakdown_lines.append(f"total ${cart.grand_total:.2f}")
+        breakdown = ", ".join(breakdown_lines)
+
     if lang == "es":
         if c.service_type == "delivery":
             where = f"para entregar en {c.address}"
@@ -1146,8 +1331,7 @@ def _build_final_confirm_summary(session: "Session") -> str:
             where = "para recoger en el restaurante"
         return (
             f"Perfecto, {c.full_name.split()[0] if c.full_name else ''}, déjame confirmarte: "
-            f"{items_prose}, {where}, "
-            f"con un total de ${cart.grand_total:.2f}. "
+            f"{items_prose}, {where}. {breakdown}. "
             f"¿Está todo bien así?"
         )
     else:
@@ -1157,8 +1341,7 @@ def _build_final_confirm_summary(session: "Session") -> str:
             where = "for pickup at the restaurant"
         return (
             f"Alright {c.full_name.split()[0] if c.full_name else ''}, let me confirm: "
-            f"{items_prose}, {where}, "
-            f"coming to ${cart.grand_total:.2f} total. "
+            f"{items_prose}, {where} — {breakdown}. "
             f"Does that all sound right?"
         )
 
@@ -1377,7 +1560,7 @@ async def chat_endpoint(request: ChatRequest):
             session_id         = str(uuid.uuid4()),
             tenant_id          = ctx.tenant_id,
             tenant             = ctx,
-            cart               = OrderCart(),
+            cart               = OrderCart(tenant_default_tax=ctx.default_tax_rate),
             status             = State.ORDER,
             language           = detected_lang,
             channel            = request.channel,
@@ -1509,7 +1692,7 @@ async def chat_endpoint(request: ChatRequest):
 
         elif intent == "cancel":
             session.status = State.ORDER
-            session.cart   = OrderCart()
+            session.cart   = OrderCart(tenant_default_tax=session.tenant.default_tax_rate)
             final_reply = (
                 "No te preocupes, empecemos de nuevo. ¿Qué se te antoja?"
                 if session.language == "es" else
@@ -1523,8 +1706,12 @@ async def chat_endpoint(request: ChatRequest):
                 logger.info(
                     f"[mapbox] valid={result['valid']} "
                     f"relevance={result.get('relevance',0):.2f} "
+                    f"out_of_zone={result.get('out_of_zone', False)} "
+                    f"distance_km={result.get('distance_km')} "
                     f"canonical='{result.get('canonical','')[:80]}'"
                 )
+
+                # Case 1: address found and within delivery zone
                 if result["valid"]:
                     session.collected.address           = result["canonical"]
                     session.collected.address_validated = True
@@ -1549,6 +1736,29 @@ async def chat_endpoint(request: ChatRequest):
                             f"want to leave me an email for the order confirmation? "
                             f"If you'd rather not, that's totally fine."
                         )
+
+                # Case 2: address found but out of delivery zone
+                elif result.get("out_of_zone"):
+                    session.address_attempts += 1
+                    dist = result.get("distance_km")
+                    radius = (
+                        session.tenant.services.get("delivery").delivery_radius_km
+                        if session.tenant.services.get("delivery") else None
+                    )
+                    if session.language == "es":
+                        final_reply = (
+                            f"Ufff, esa dirección está a unos {dist:.0f} km de nosotros "
+                            f"y solo entregamos hasta {radius:.0f} km a la redonda. "
+                            f"¿Tienes otra dirección más cerca, o prefieres cambiar a pickup?"
+                        )
+                    else:
+                        final_reply = (
+                            f"Oof, that address is about {dist:.0f} km from us, and we only "
+                            f"deliver within {radius:.0f} km. Do you have an address closer by, "
+                            f"or would you rather switch to pickup?"
+                        )
+
+                # Case 3: address not found or low relevance
                 else:
                     session.address_attempts += 1
                     sugg = result.get("suggestions", [])[:2]
@@ -1685,7 +1895,7 @@ async def chat_endpoint(request: ChatRequest):
 
         elif confirmation == "no":
             session.status = State.ORDER
-            session.cart   = OrderCart()
+            session.cart   = OrderCart(tenant_default_tax=session.tenant.default_tax_rate)
             final_reply = (
                 "No te preocupes, volvamos al pedido. ¿Qué quieres cambiar?"
                 if session.language == "es" else
@@ -1731,18 +1941,35 @@ async def chat_endpoint(request: ChatRequest):
                         unit_price = float(db_item["price"])
                         item_code  = db_item["item_code"]
                         name       = db_item["name"]
-                        logger.info(f"[cart] DB match: {name} code={item_code} price=${unit_price}")
+                        # Lang-specific plural (falls back inside display_name)
+                        translated_plural = lookup_translated_plural(
+                            ctx.tenant_id, item_code, session.language
+                        )
+                        plural = translated_plural or (db_item.get("name_plural") or "")
+                        is_exempt = bool(db_item.get("is_tax_exempt", False))
+                        rate_override = db_item.get("tax_rate_override")
+                        rate_override = float(rate_override) if rate_override is not None else None
+                        logger.info(
+                            f"[cart] DB match: {name} code={item_code} price=${unit_price} "
+                            f"plural='{plural}' tax_exempt={is_exempt} override={rate_override}"
+                        )
                     else:
                         unit_price = float(item_data.get("unit_price", 0))
                         item_code  = item_data.get("item_code", "")
+                        plural     = ""
+                        is_exempt  = False
+                        rate_override = None
                         logger.warning(f"[cart] item not found in DB: '{name}'")
 
                     session.cart.add_item(
-                        name       = name,
-                        quantity   = int(item_data.get("quantity", 1)),
-                        unit_price = unit_price,
-                        prep_notes = item_data.get("prep_notes", ""),
-                        item_code  = item_code,
+                        name              = name,
+                        quantity          = int(item_data.get("quantity", 1)),
+                        unit_price        = unit_price,
+                        prep_notes        = item_data.get("prep_notes", ""),
+                        item_code         = item_code,
+                        name_plural       = plural,
+                        is_tax_exempt     = is_exempt,
+                        tax_rate_override = rate_override,
                     )
 
             elif action["action"] == "remove":
@@ -1854,6 +2081,7 @@ def _response(session: Session, reply: str) -> dict:
             "order_number":    c.order_number,
             "cart_items":      len(session.cart.items),
             "cart_subtotal":   session.cart.subtotal,
+            "cart_tax":        session.cart.tax_total,
             "delivery_fee":    session.cart.delivery_fee,
             "collected": {
                 "full_name":   c.full_name,
@@ -1896,7 +2124,14 @@ async def get_session(from_number: str):
         "service_type":   session.collected.service_type,
         "cart":           session.cart.to_list(),
         "cart_subtotal":  session.cart.subtotal,
+        "cart_tax":       session.cart.tax_total,
+        "cart_delivery":  session.cart.delivery_fee,
         "cart_total":     session.cart.grand_total,
+        "tenant_tax_rate": session.tenant.default_tax_rate,
+        "delivery_radius_km": (
+            session.tenant.services.get("delivery").delivery_radius_km
+            if session.tenant.services.get("delivery") else None
+        ),
         "collected": {
             "full_name":    session.collected.full_name,
             "address":      session.collected.address,
@@ -1944,6 +2179,359 @@ async def clear_proximity_cache():
     n = len(_TENANT_PROXIMITY)
     _TENANT_PROXIMITY.clear()
     return {"cleared": n}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Order management endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+ORDER_STATUS_FLOW = {
+    "pending":          {"confirmed", "cancelled"},
+    "confirmed":        {"preparing", "cancelled"},
+    "preparing":        {"ready", "cancelled"},
+    "ready":            {"out_for_delivery", "delivered", "cancelled"},
+    "out_for_delivery": {"delivered", "cancelled"},
+    "delivered":        set(),   # terminal
+    "cancelled":        set(),   # terminal
+}
+
+VALID_PAYMENT_METHODS = {"card", "interac", "e_transfer", "cash"}
+VALID_PAYMENT_STATUS  = {"pending", "paid", "failed", "refunded"}
+
+
+class OrderStatusUpdate(BaseModel):
+    status: str   # one of ORDER_STATUS_FLOW keys
+
+
+class OrderPaymentUpdate(BaseModel):
+    payment_method: Optional[str] = None
+    payment_status: Optional[str] = None
+    mark_paid:      bool          = False   # if True, sets paid_at = NOW()
+
+
+class OrderCancel(BaseModel):
+    reason: Optional[str] = None
+
+
+def _fetch_order_row(conn, order_number: str) -> Optional[dict]:
+    row = conn.execute(text("""
+        SELECT id, order_number, tenant_id, customer_id,
+               customer_name, customer_phone, customer_email,
+               service_type, delivery_address,
+               order_date, status,
+               subtotal, tax_total, tip_total, delivery_total, grand_total,
+               notes, session_id,
+               payment_method, payment_status,
+               paid_at, prepared_at, out_for_delivery_at, delivered_at,
+               cancelled_at, cancellation_reason, created_at
+        FROM orders
+        WHERE order_number = :num
+    """), {"num": order_number}).mappings().first()
+    return dict(row) if row else None
+
+
+def _fetch_order_items(conn, order_id: int) -> list[dict]:
+    rows = conn.execute(text("""
+        SELECT id, line_type, item_code, item_name,
+               quantity, unit_price, line_total, prep_notes,
+               is_tax_exempt, tax_rate, tax_amount, created_at
+        FROM order_items
+        WHERE order_id = :oid
+        ORDER BY
+            CASE line_type WHEN 'item' THEN 1
+                           WHEN 'delivery' THEN 2
+                           WHEN 'tax' THEN 3
+                           ELSE 4 END,
+            id
+    """), {"oid": order_id}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def _coerce_value(v):
+    """Convert Decimal → float, datetime/date → ISO string, leave others alone."""
+    if v is None:
+        return None
+    if hasattr(v, "quantize"):
+        return float(v)
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return v
+
+
+def _serialize_order(order: dict, items: list[dict]) -> dict:
+    return {
+        "order_number":        order["order_number"],
+        "tenant_id":           order["tenant_id"],
+        "customer_id":         str(order["customer_id"]) if order["customer_id"] else None,
+        "customer_name":       order["customer_name"],
+        "customer_phone":      order["customer_phone"],
+        "customer_email":      order["customer_email"],
+        "service_type":        order["service_type"],
+        "delivery_address":    order["delivery_address"],
+        "status":              order["status"],
+        "payment_method":      order["payment_method"],
+        "payment_status":      order["payment_status"],
+        "subtotal":            _coerce_value(order["subtotal"]),
+        "tax_total":           _coerce_value(order["tax_total"]),
+        "tip_total":           _coerce_value(order["tip_total"]),
+        "delivery_total":      _coerce_value(order["delivery_total"]),
+        "grand_total":         _coerce_value(order["grand_total"]),
+        "notes":               order["notes"],
+        "session_id":          order["session_id"],
+        "cancellation_reason": order["cancellation_reason"],
+        "timestamps": {
+            "order_date":          _coerce_value(order["order_date"]),
+            "created_at":          _coerce_value(order["created_at"]),
+            "paid_at":             _coerce_value(order["paid_at"]),
+            "prepared_at":         _coerce_value(order["prepared_at"]),
+            "out_for_delivery_at": _coerce_value(order["out_for_delivery_at"]),
+            "delivered_at":        _coerce_value(order["delivered_at"]),
+            "cancelled_at":        _coerce_value(order["cancelled_at"]),
+        },
+        "items": [
+            {
+                "line_type":     it["line_type"],
+                "item_code":     it["item_code"],
+                "item_name":     it["item_name"],
+                "quantity":      _coerce_value(it["quantity"]),
+                "unit_price":    _coerce_value(it["unit_price"]),
+                "line_total":    _coerce_value(it["line_total"]),
+                "prep_notes":    it["prep_notes"],
+                "is_tax_exempt": it["is_tax_exempt"],
+                "tax_rate":      _coerce_value(it["tax_rate"]),
+                "tax_amount":    _coerce_value(it["tax_amount"]),
+            }
+            for it in items
+        ],
+    }
+
+
+@app.get("/orders/{order_number}")
+async def get_order(order_number: str):
+    """Full detail of a single order."""
+    with engine.connect() as conn:
+        order = _fetch_order_row(conn, order_number)
+        if not order:
+            raise HTTPException(404, f"Order {order_number} not found")
+        items = _fetch_order_items(conn, order["id"])
+    return _serialize_order(order, items)
+
+
+@app.patch("/orders/{order_number}/status")
+async def update_order_status(order_number: str, body: OrderStatusUpdate):
+    """
+    Move the order through the workflow. Enforces valid transitions:
+      pending → confirmed → preparing → ready → out_for_delivery → delivered
+      (cancelled reachable from any non-terminal state)
+    Automatically stamps the matching timestamp.
+    """
+    new_status = body.status.strip().lower()
+    if new_status not in ORDER_STATUS_FLOW:
+        raise HTTPException(400, f"Invalid status '{new_status}'. "
+                                 f"Allowed: {sorted(ORDER_STATUS_FLOW.keys())}")
+
+    with engine.begin() as conn:
+        order = _fetch_order_row(conn, order_number)
+        if not order:
+            raise HTTPException(404, f"Order {order_number} not found")
+
+        current = order["status"]
+        if new_status == current:
+            return {"ok": True, "order_number": order_number, "status": current,
+                    "note": "Status already set, no change."}
+
+        allowed = ORDER_STATUS_FLOW.get(current, set())
+        if new_status not in allowed:
+            raise HTTPException(409,
+                f"Invalid transition '{current}' → '{new_status}'. "
+                f"From '{current}', allowed next states are: {sorted(allowed) or 'none (terminal)'}.")
+
+        ts_col_by_status = {
+            "preparing":        "prepared_at",
+            "ready":            "prepared_at",
+            "out_for_delivery": "out_for_delivery_at",
+            "delivered":        "delivered_at",
+            "cancelled":        "cancelled_at",
+        }
+        ts_col = ts_col_by_status.get(new_status)
+
+        if ts_col:
+            sql = f"UPDATE orders SET status = :s, {ts_col} = COALESCE({ts_col}, NOW()) WHERE id = :oid"
+        else:
+            sql = "UPDATE orders SET status = :s WHERE id = :oid"
+
+        conn.execute(text(sql), {"s": new_status, "oid": order["id"]})
+
+    logger.info(f"[orders] {order_number}: {current} → {new_status}")
+    return {"ok": True, "order_number": order_number,
+            "previous_status": current, "status": new_status}
+
+
+@app.patch("/orders/{order_number}/payment")
+async def update_order_payment(order_number: str, body: OrderPaymentUpdate):
+    """
+    Set payment_method and/or payment_status. Enforces:
+      - Valid enum values for both fields.
+      - Cash is only allowed when service_type='pickup' (also enforced by DB).
+      - If `mark_paid` is true OR payment_status='paid', stamps paid_at.
+    """
+    if body.payment_method is None and body.payment_status is None and not body.mark_paid:
+        raise HTTPException(400, "Provide at least one of payment_method, payment_status, or mark_paid.")
+
+    if body.payment_method is not None:
+        pm = body.payment_method.strip().lower()
+        if pm not in VALID_PAYMENT_METHODS:
+            raise HTTPException(400, f"Invalid payment_method '{pm}'. "
+                                     f"Allowed: {sorted(VALID_PAYMENT_METHODS)}")
+        body.payment_method = pm
+
+    if body.payment_status is not None:
+        ps = body.payment_status.strip().lower()
+        if ps not in VALID_PAYMENT_STATUS:
+            raise HTTPException(400, f"Invalid payment_status '{ps}'. "
+                                     f"Allowed: {sorted(VALID_PAYMENT_STATUS)}")
+        body.payment_status = ps
+
+    with engine.begin() as conn:
+        order = _fetch_order_row(conn, order_number)
+        if not order:
+            raise HTTPException(404, f"Order {order_number} not found")
+
+        # Pre-check the cash/pickup business rule at the app layer too,
+        # so the error message is friendlier than the raw constraint violation.
+        new_method = body.payment_method if body.payment_method is not None else order["payment_method"]
+        if new_method == "cash" and order["service_type"] != "pickup":
+            raise HTTPException(400,
+                f"Payment method 'cash' is only allowed for pickup orders. "
+                f"This order's service_type is '{order['service_type']}'.")
+
+        sets   = []
+        params = {"oid": order["id"]}
+        if body.payment_method is not None:
+            sets.append("payment_method = :pm")
+            params["pm"] = body.payment_method
+        if body.payment_status is not None:
+            sets.append("payment_status = :ps")
+            params["ps"] = body.payment_status
+        should_stamp_paid = body.mark_paid or body.payment_status == "paid"
+        if should_stamp_paid:
+            sets.append("paid_at = COALESCE(paid_at, NOW())")
+            if body.payment_status is None:
+                sets.append("payment_status = 'paid'")
+
+        sql = f"UPDATE orders SET {', '.join(sets)} WHERE id = :oid"
+        conn.execute(text(sql), params)
+
+    logger.info(f"[orders] {order_number} payment updated: "
+                f"method={body.payment_method} status={body.payment_status} mark_paid={body.mark_paid}")
+    return {"ok": True, "order_number": order_number}
+
+
+@app.post("/orders/{order_number}/cancel")
+async def cancel_order(order_number: str, body: OrderCancel):
+    """Convenience endpoint: status='cancelled', stamps cancelled_at, stores reason."""
+    with engine.begin() as conn:
+        order = _fetch_order_row(conn, order_number)
+        if not order:
+            raise HTTPException(404, f"Order {order_number} not found")
+        if order["status"] in ("delivered", "cancelled"):
+            raise HTTPException(409, f"Cannot cancel order in '{order['status']}' state.")
+
+        conn.execute(text("""
+            UPDATE orders
+            SET status = 'cancelled',
+                cancelled_at = COALESCE(cancelled_at, NOW()),
+                cancellation_reason = :reason
+            WHERE id = :oid
+        """), {"reason": body.reason, "oid": order["id"]})
+
+    logger.info(f"[orders] {order_number} cancelled. reason={body.reason!r}")
+    return {"ok": True, "order_number": order_number, "status": "cancelled"}
+
+
+@app.get("/tenants/{tenant_id}/orders")
+async def list_tenant_orders(
+    tenant_id: str,
+    status: Optional[str] = None,
+    payment_status: Optional[str] = None,
+    service_type: Optional[str] = None,
+    date_from: Optional[str] = None,   # ISO date 'YYYY-MM-DD'
+    date_to:   Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """
+    Filtered list of orders for a tenant. Useful for dashboards.
+    Returns header info per order (no line items — use /orders/{number} for detail).
+    """
+    where  = ["tenant_id = :tid"]
+    params = {"tid": tenant_id, "lim": min(max(limit, 1), 500), "off": max(offset, 0)}
+    if status:
+        where.append("status = :st"); params["st"] = status.strip().lower()
+    if payment_status:
+        where.append("payment_status = :ps"); params["ps"] = payment_status.strip().lower()
+    if service_type:
+        where.append("service_type = :svc"); params["svc"] = service_type.strip().lower()
+    if date_from:
+        where.append("order_date >= :df"); params["df"] = date_from
+    if date_to:
+        where.append("order_date <= :dt"); params["dt"] = date_to
+
+    sql = f"""
+        SELECT order_number, customer_name, service_type, status,
+               payment_method, payment_status,
+               subtotal, tax_total, delivery_total, grand_total,
+               order_date, created_at
+        FROM orders
+        WHERE {' AND '.join(where)}
+        ORDER BY order_date DESC, id DESC
+        LIMIT :lim OFFSET :off
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text(sql), params).mappings().all()
+
+    return {
+        "tenant_id": tenant_id,
+        "count":     len(rows),
+        "limit":     params["lim"],
+        "offset":    params["off"],
+        "orders":    [{k: _coerce_value(v) for k, v in r.items()} for r in rows],
+    }
+
+
+@app.get("/tenants/{tenant_id}/orders/today")
+async def today_orders_snapshot(tenant_id: str):
+    """Today's operational snapshot: counts by status + revenue totals."""
+    with engine.connect() as conn:
+        agg = conn.execute(text("""
+            SELECT
+                COUNT(*)                                                   AS orders_count,
+                COUNT(*) FILTER (WHERE status = 'cancelled')               AS cancelled_count,
+                COUNT(*) FILTER (WHERE status = 'delivered')               AS delivered_count,
+                COUNT(*) FILTER (WHERE status IN ('confirmed','preparing','ready','out_for_delivery')) AS in_progress_count,
+                COUNT(*) FILTER (WHERE payment_status = 'paid')            AS paid_count,
+                COALESCE(SUM(subtotal),       0)                           AS subtotal_sum,
+                COALESCE(SUM(tax_total),      0)                           AS tax_sum,
+                COALESCE(SUM(delivery_total), 0)                           AS delivery_sum,
+                COALESCE(SUM(grand_total) FILTER (WHERE status <> 'cancelled'), 0) AS revenue_excl_cancelled
+            FROM orders
+            WHERE tenant_id = :tid AND DATE(order_date) = CURRENT_DATE
+        """), {"tid": tenant_id}).mappings().first()
+
+        by_status = conn.execute(text("""
+            SELECT status, COUNT(*) AS n
+            FROM orders
+            WHERE tenant_id = :tid AND DATE(order_date) = CURRENT_DATE
+            GROUP BY status
+            ORDER BY n DESC
+        """), {"tid": tenant_id}).mappings().all()
+
+    return {
+        "tenant_id":        tenant_id,
+        "date":             datetime.now().strftime("%Y-%m-%d"),
+        "summary":          {k: _coerce_value(v) for k, v in agg.items()},
+        "orders_by_status": [{"status": r["status"], "count": r["n"]} for r in by_status],
+    }
 
 
 if __name__ == "__main__":
