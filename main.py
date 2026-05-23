@@ -1,15 +1,15 @@
 """
-SaaS Restaurant Multi-Tenant Chat API — v4.6
+SaaS Restaurant Multi-Tenant Chat API — v4.7
 =============================================
-Changes from v4.5:
-  - FIX: Cart-empty guardrail in STATE.ORDER — intercepts "delivery"/"pickup"/
-    "yes"/address-like messages BEFORE calling the LLM, redirecting customer
-    to order food first. Prevents LLM from improvising checkout questions.
-  - FIX: "confirm" action with empty cart now responds explicitly instead of
-    silently falling through to the LLM.
-  - FIX: Mapbox now uses tenant's city/state/country dynamically, with
-    geocoded proximity cached per-tenant. Threshold lowered to 0.5.
-  - System prompt for ORDER state has stronger empty-cart rules.
+Changes from v4.6:
+  - FIX: _extract_order_action prompt rewritten with explicit few-shot examples
+    so Claude/Groq classifiers reliably output "add" for order statements.
+    Previous prompt was too abstract and the classifier returned "unclear"
+    or "inquiry" for clear add requests like "I'd like 2 pupusas revueltas",
+    leaving the cart empty while the conversational LLM hallucinated success.
+  - Menu context expanded from 3000 → 6000 chars (some menus were truncated).
+  - CLASSIFIER_TOKENS bumped 200 → 400 to fit larger JSON output.
+  - [cart_action_raw] logs the raw LLM output on EVERY call for debugging.
 """
 
 import os
@@ -50,13 +50,13 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set.")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
-app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.6.0")
+app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.7.0")
 app.include_router(notifications_router)
 
 TEMPERATURE       = 0.1
 MAX_TOKENS        = 400
 SEED              = 42
-CLASSIFIER_TOKENS = 200
+CLASSIFIER_TOKENS = 400
 CLASSIFIER_TEMP   = 0.0
 MAPBOX_THRESHOLD  = 0.5
 
@@ -838,47 +838,74 @@ async def validate_address_mapbox(address: str, ctx: TenantContext) -> dict:
 def _extract_order_action(llm: LLMProvider, message: str, cart: OrderCart,
                           menu_text: str, tenant_id: str) -> dict:
     cart_display = cart.to_display() if not cart.is_empty else "Empty cart"
-    prompt = f"""You are an order action extractor for a restaurant.
+    prompt = f"""You extract structured order actions from a customer message in a restaurant chat. You ALWAYS respond with valid JSON only.
 
-Current cart:
+CURRENT CART:
 {cart_display}
 
-Menu (use EXACT item codes and names):
-{menu_text[:3000]}
+MENU (use these EXACT item_code and name values — never invent):
+{menu_text[:6000]}
 
-Customer message: "{message}"
+CUSTOMER MESSAGE: "{message}"
 
-Reply with JSON ONLY. No explanation, no markdown.
+Decide ONE action:
+- "add"     → customer wants to ADD one or more items (e.g. "I'd like 2 pupusas", "give me a horchata", "add a tamarindo")
+- "remove"  → customer wants to REMOVE an item from the cart (e.g. "remove the horchata", "take off the soda")
+- "modify"  → customer wants to CHANGE quantity or prep notes of an item ALREADY in cart (e.g. "make it 3 instead of 2", "no onions on the pupusa")
+- "confirm" → customer is done and confirms the cart (e.g. "that's everything", "that's all", "ok", "yes that's it", "ready to checkout")
+- "inquiry" → customer asks a QUESTION about menu/hours/ingredients without ordering (e.g. "what drinks do you have?", "is it spicy?")
+- "unclear" → truly cannot tell
 
-{{
-  "action": "add|remove|modify|confirm|unclear|inquiry",
-  "items_to_add": [
-    {{"item_code": "e.g. PUP-001", "name": "exact item name", "quantity": 1, "prep_notes": "e.g. no sauce"}}
-  ],
-  "items_to_remove": ["exact item name"],
-  "items_to_modify": [
-    {{"name": "exact item name", "prep_notes": "new notes", "quantity": 0}}
-  ]
-}}
+CRITICAL RULES:
+- If the message contains a menu item name with a quantity word (one, two, 2, 3, a, an) OR phrases like "I want", "I'd like", "give me", "add", "also", "and", "plus" followed by an item → action is "add".
+- Match menu items loosely (e.g. "pupusa revuelta" → find "Pupusa Revuelta", "horchata" → find "Horchata Salvadoreña"). Use the closest match from the menu.
+- For quantities: "a" / "an" / "one" = 1, "two" = 2, "three" = 3, etc.
+- For "modify": only use this if the item is ALREADY in the cart and the customer wants to change it.
+- Never invent item_code or name values that aren't in the menu above.
 
-Rules:
-- action "confirm" = customer confirms order (yes/ok/correct/that's everything)
-- action "inquiry" = question about menu, hours, ingredients
-- action "unclear" = cannot determine
-- quantity 0 in modify = keep existing
+EXAMPLES:
+
+Message: "I'd like 2 pupusas revueltas"
+{{"action":"add","items_to_add":[{{"item_code":"PUP-001","name":"Pupusa Revuelta","quantity":2,"prep_notes":""}}],"items_to_remove":[],"items_to_modify":[]}}
+
+Message: "add 1 horchata please"
+{{"action":"add","items_to_add":[{{"item_code":"BEV-001","name":"Horchata Salvadoreña","quantity":1,"prep_notes":""}}],"items_to_remove":[],"items_to_modify":[]}}
+
+Message: "also 1 pupusa de queso, no onions"
+{{"action":"add","items_to_add":[{{"item_code":"PUP-003","name":"Pupusa Solo Queso","quantity":1,"prep_notes":"no onions"}}],"items_to_remove":[],"items_to_modify":[]}}
+
+Message: "remove the horchata"
+{{"action":"remove","items_to_add":[],"items_to_remove":["Horchata Salvadoreña"],"items_to_modify":[]}}
+
+Message: "actually make it 3 pupusas revueltas instead of 2"
+{{"action":"modify","items_to_add":[],"items_to_remove":[],"items_to_modify":[{{"name":"Pupusa Revuelta","prep_notes":"","quantity":3}}]}}
+
+Message: "that's everything"
+{{"action":"confirm","items_to_add":[],"items_to_remove":[],"items_to_modify":[]}}
+
+Message: "what drinks do you have?"
+{{"action":"inquiry","items_to_add":[],"items_to_remove":[],"items_to_modify":[]}}
+
+Now respond with JSON ONLY for the customer message above. No markdown, no explanation.
 """
     result = ""
     try:
         result = llm.classify(prompt, max_tokens=CLASSIFIER_TOKENS)
+        logger.info(f"[cart_action_raw] message='{message[:80]}' raw={result[:300] if result else 'EMPTY'}")
         result = re.sub(r"```json|```", "", result).strip()
         json_match = re.search(r"\{.*\}", result, re.DOTALL)
         if json_match:
             result = json_match.group(0)
         data = json.loads(result)
-        logger.info(f"[cart_action] action={data.get('action')} add={len(data.get('items_to_add',[]))}")
+        logger.info(
+            f"[cart_action] action={data.get('action')} "
+            f"add={len(data.get('items_to_add',[]))} "
+            f"remove={len(data.get('items_to_remove',[]))} "
+            f"modify={len(data.get('items_to_modify',[]))}"
+        )
         return data
     except Exception as e:
-        logger.error(f"[extract_order_action] error: {e} raw={result[:200] if result else 'N/A'}")
+        logger.error(f"[extract_order_action] error: {e} raw={result[:300] if result else 'N/A'}")
         return {"action": "unclear", "items_to_add": [], "items_to_remove": [], "items_to_modify": []}
 
 
