@@ -615,14 +615,23 @@ def _detect_order_confirmation(llm_reply: str, customer_msg: str, conversation: 
     def extract(text: str) -> tuple[list[str], float]:
         lines, total = [], 0.0
         for line in text.split("\n"):
-            if "$" in line and len(line.strip()) > 4:
-                lines.append(line.strip())
-                if not any(w in line.lower() for w in _TOTAL_WORDS):
-                    for p in _PRICE_RE.findall(line):
-                        try:
-                            total += float(p.replace("$", ""))
-                        except ValueError:
-                            pass
+            stripped = line.strip().lstrip("*•-– ").strip()
+            if not stripped or len(stripped) < 4:
+                continue
+            if "?" in stripped:
+                continue
+            if any(w in stripped.lower() for w in _TOTAL_WORDS):
+                continue
+            if any(w in stripped.lower() for w in ("would you","anything else","shall i","want to add","how about","add anything")):
+                continue
+            prices = _PRICE_RE.findall(stripped)
+            if prices:
+                lines.append(stripped)
+                for p in prices:
+                    try:
+                        total += float(p.replace("$", ""))
+                    except ValueError:
+                        pass
         return lines, total
 
     lines, total = extract(llm_reply)
