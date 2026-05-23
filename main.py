@@ -920,7 +920,9 @@ async def chat_endpoint(request: ChatRequest):
                   "good afternoon","good evening","start","restart","nuevo","nueva",
                   "buenas tardes","buenas noches"}
     _DONE_PHRASES = {"thank you","thanks","gracias","ty","thx","perfecto","ok gracias",
-                     "thank u","muchas gracias","de nada","awesome","great","perfect"}
+                 "thank u","muchas gracias","de nada","awesome","great","perfect",
+                 "how long","when will","where is my","track","cuanto tiempo",
+                 "cuando llega","gracias por todo"}
     msg_clean      = request.message.strip().lower()
     is_greeting    = msg_clean in _GREETINGS
     is_done_phrase = msg_clean in _DONE_PHRASES
@@ -1232,12 +1234,12 @@ async def chat_endpoint(request: ChatRequest):
                 )
 
     else:
-        c = session.collected
-        final_reply = (
-            f"Tu pedido ya fue confirmado, {c.full_name or ''}. ¡Gracias!"
-            if session.language == "es" else
-            f"Your order is already confirmed, {c.full_name or ''}. Thank you!"
-        )
+            c = session.collected
+            final_reply = (
+                f"Tu pedido ya fue confirmado, {c.full_name or 'amigo'}. ¡Gracias!"
+                if session.language == "es" else
+                f"Your order is already confirmed, {c.full_name or 'friend'}. Thank you!"
+            )
 
     session.messages.append({"role": "assistant", "content": final_reply})
     return _response(session, final_reply)
