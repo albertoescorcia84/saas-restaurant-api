@@ -984,6 +984,15 @@ async def chat_endpoint(request: ChatRequest):
         chose_pickup   = any(w in msg_lower for w in pickup_kw)
         chose_delivery = any(w in msg_lower for w in delivery_kw)
 
+        # NEW: if only one service available and customer says yes, auto-select it
+        avail_order = [s for s in avail if s.service_type in ("pickup","delivery")]
+        if not chose_pickup and not chose_delivery and _is_affirmative(request.message):
+            if len(avail_order) == 1:
+                if avail_order[0].service_type == "delivery":
+                    chose_delivery = True
+                else:
+                    chose_pickup = True
+
         if chose_pickup and avail_pickup:
             session.collected.service_type  = "pickup"
             session.collected.delivery_fee  = 0.0
