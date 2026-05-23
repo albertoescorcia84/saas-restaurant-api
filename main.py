@@ -1,15 +1,17 @@
 """
-SaaS Restaurant Multi-Tenant Chat API — v4.7
+SaaS Restaurant Multi-Tenant Chat API — v4.8
 =============================================
-Changes from v4.6:
-  - FIX: _extract_order_action prompt rewritten with explicit few-shot examples
-    so Claude/Groq classifiers reliably output "add" for order statements.
-    Previous prompt was too abstract and the classifier returned "unclear"
-    or "inquiry" for clear add requests like "I'd like 2 pupusas revueltas",
-    leaving the cart empty while the conversational LLM hallucinated success.
-  - Menu context expanded from 3000 → 6000 chars (some menus were truncated).
-  - CLASSIFIER_TOKENS bumped 200 → 400 to fit larger JSON output.
-  - [cart_action_raw] logs the raw LLM output on EVERY call for debugging.
+Changes from v4.7:
+  - CHECKOUT and FINAL_CONFIRM are now FULLY DETERMINISTIC. The LLM no
+    longer generates these messages — they're built from session state.
+    This prevents the LLM from:
+      * Improvising extra fields (phone number) not collected by the FSM
+      * Truncating Mapbox-normalized addresses in the summary
+      * Hallucinating wrong totals (was showing two different totals)
+  - Added few-shot examples for "give me one X" / "i'll take X" / "lemme get X"
+    patterns in _extract_order_action.
+  - DONE state response is also deterministic now.
+  - All deterministic replies are bilingual (en/es).
 """
 
 import os
@@ -50,7 +52,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set.")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
-app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.7.0")
+app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.8.0")
 app.include_router(notifications_router)
 
 TEMPERATURE       = 0.1
@@ -874,6 +876,15 @@ Message: "add 1 horchata please"
 Message: "also 1 pupusa de queso, no onions"
 {{"action":"add","items_to_add":[{{"item_code":"PUP-003","name":"Pupusa Solo Queso","quantity":1,"prep_notes":"no onions"}}],"items_to_remove":[],"items_to_modify":[]}}
 
+Message: "give me one tamarindo"
+{{"action":"add","items_to_add":[{{"item_code":"DRK-004","name":"Jugo de Tamarindo","quantity":1,"prep_notes":""}}],"items_to_remove":[],"items_to_modify":[]}}
+
+Message: "i'll take a coke"
+{{"action":"add","items_to_add":[{{"item_code":"DRK-005","name":"Coca-Cola","quantity":1,"prep_notes":""}}],"items_to_remove":[],"items_to_modify":[]}}
+
+Message: "lemme get 2 tacos"
+{{"action":"add","items_to_add":[{{"item_code":"TAC-001","name":"Taco","quantity":2,"prep_notes":""}}],"items_to_remove":[],"items_to_modify":[]}}
+
 Message: "remove the horchata"
 {{"action":"remove","items_to_add":[],"items_to_remove":["Horchata Salvadoreña"],"items_to_modify":[]}}
 
@@ -1040,6 +1051,63 @@ def _clean_base_prompt(raw: str, brand: str) -> str:
     cleaned = cleaned.replace("{restaurant_name}", brand).replace("{menu_context}", "")
     cleaned = re.sub(r"Menu Context:[^\n]*", "", cleaned, flags=re.IGNORECASE).strip()
     return cleaned if len(cleaned) >= 20 else f"You are a professional ordering assistant for {brand}."
+
+
+def _build_final_confirm_summary(session: "Session") -> str:
+    """
+    Builds a complete, deterministic order summary. NO LLM involved.
+    Uses exact cart totals and Mapbox-normalized address.
+    """
+    c    = session.collected
+    lang = session.language
+    cart = session.cart
+
+    # Items block
+    item_lines = []
+    for item in cart.items:
+        note = f" ({item.prep_notes})" if item.prep_notes else ""
+        qty  = f"{item.quantity}x " if item.quantity > 1 else ""
+        item_lines.append(f"• {qty}{item.name}{note} — ${item.line_total:.2f}")
+    items_block = "\n".join(item_lines)
+
+    if lang == "es":
+        delivery_line = (
+            f"📦 *Entrega a:* {c.address}\n" if c.service_type == "delivery"
+            else "🏃 *Recoger en el restaurante*\n"
+        )
+        email_line   = f"📧 *Email:* {c.email}\n" if c.email else ""
+        fee_line     = f"*Envío:* ${cart.delivery_fee:.2f}\n" if cart.delivery_fee > 0 else ""
+        return (
+            f"¡Perfecto! Aquí está tu pedido completo — ¿todo se ve bien? 😊\n\n"
+            f"📋 *Resumen del pedido:*\n"
+            f"{items_block}\n\n"
+            f"👤 *Nombre:* {c.full_name}\n"
+            f"{delivery_line}"
+            f"{email_line}"
+            f"\n*Subtotal:* ${cart.subtotal:.2f}\n"
+            f"{fee_line}"
+            f"*Total:* ${cart.grand_total:.2f}\n\n"
+            f"¿Confirmas? Responde *sí* para finalizar."
+        )
+    else:
+        delivery_line = (
+            f"📦 *Delivery to:* {c.address}\n" if c.service_type == "delivery"
+            else "🏃 *Pickup at the restaurant*\n"
+        )
+        email_line   = f"📧 *Email:* {c.email}\n" if c.email else ""
+        fee_line     = f"*Delivery:* ${cart.delivery_fee:.2f}\n" if cart.delivery_fee > 0 else ""
+        return (
+            f"Here's your complete order — does everything look right? 😊\n\n"
+            f"📋 *Order summary:*\n"
+            f"{items_block}\n\n"
+            f"👤 *Name:* {c.full_name}\n"
+            f"{delivery_line}"
+            f"{email_line}"
+            f"\n*Subtotal:* ${cart.subtotal:.2f}\n"
+            f"{fee_line}"
+            f"*Total:* ${cart.grand_total:.2f}\n\n"
+            f"Reply *yes* to confirm."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1293,12 +1361,22 @@ async def chat_endpoint(request: ChatRequest):
             session.collected.delivery_fee = 0.0
             session.cart.delivery_fee      = 0.0
             session.status                 = State.CHECKOUT
-            session.checkout_field         = CheckoutField.NAME if not session.collected.full_name else CheckoutField.EMAIL
-            final_reply = (
-                "¡Perfecto, pickup! 🏃 Sin costo de envío. ¿Me puedes dar tu nombre completo?"
-                if session.language == "es" else
-                "Perfect, pickup it is! 🏃 No delivery fee. What's your full name for the order?"
-            )
+            if not session.collected.full_name:
+                session.checkout_field = CheckoutField.NAME
+                final_reply = (
+                    "¡Perfecto, pickup! 🏃 Sin costo de envío. ¿Cuál es tu nombre completo para la orden?"
+                    if session.language == "es" else
+                    "Perfect, pickup it is! 🏃 No delivery fee. What's your full name for the order?"
+                )
+            else:
+                session.checkout_field = CheckoutField.EMAIL
+                final_reply = (
+                    f"¡Perfecto, pickup, {session.collected.full_name.split()[0]}! 🏃 Sin costo de envío. "
+                    f"Última cosa — ¿cuál es tu email? (opcional). Responde *skip* para omitir."
+                    if session.language == "es" else
+                    f"Perfect, pickup, {session.collected.full_name.split()[0]}! 🏃 No delivery fee. "
+                    f"Last thing — what's your email? (optional). Reply *skip* to skip."
+                )
         elif chose_delivery and avail_delivery:
             fee = avail_delivery.fee_amount if avail_delivery.fee_type == "fixed" else 0.0
             session.collected.service_type = "delivery"
@@ -1356,9 +1434,27 @@ async def chat_endpoint(request: ChatRequest):
                     session.collected.address           = result["canonical"]
                     session.collected.address_validated = True
                     session.address_attempts            = 0
-                    session.checkout_field              = CheckoutField.NAME if not session.collected.full_name else CheckoutField.EMAIL
-                    _refresh_system_prompt(session)
-                    final_reply = strip_hallucinations(call_llm(llm, session.messages))
+                    # Determine next field
+                    if not session.collected.full_name:
+                        session.checkout_field = CheckoutField.NAME
+                        final_reply = (
+                            f"¡Perfecto! Verifiqué tu dirección: *{result['canonical']}* ✅\n\n"
+                            f"¿Cuál es tu nombre completo para la orden?"
+                            if session.language == "es" else
+                            f"Got it! I verified your address: *{result['canonical']}* ✅\n\n"
+                            f"What's your full name for the order?"
+                        )
+                    else:
+                        session.checkout_field = CheckoutField.EMAIL
+                        final_reply = (
+                            f"¡Perfecto! Verifiqué tu dirección: *{result['canonical']}* ✅\n\n"
+                            f"Última cosa — ¿cuál es tu email? (opcional, solo para actualizaciones del pedido). "
+                            f"Responde *skip* si prefieres omitirlo."
+                            if session.language == "es" else
+                            f"Got it! I verified your address: *{result['canonical']}* ✅\n\n"
+                            f"Last thing — what's your email? (optional, just for order updates). "
+                            f"Reply *skip* if you'd rather skip it."
+                        )
                 else:
                     session.address_attempts += 1
                     sugg = "\n".join(f"• {s}" for s in result.get("suggestions",[])[:2])
@@ -1376,16 +1472,24 @@ async def chat_endpoint(request: ChatRequest):
                         )
 
             elif current_field == CheckoutField.NAME:
-                session.collected.full_name = _extract_name(request.message)
+                name = _extract_name(request.message)
+                session.collected.full_name = name
                 session.checkout_field      = CheckoutField.EMAIL
-                _refresh_system_prompt(session)
-                final_reply = strip_hallucinations(call_llm(llm, session.messages))
+                first = name.split()[0] if name else ""
+                final_reply = (
+                    f"¡Gracias, {first}! 😊 Última cosa — ¿cuál es tu email? "
+                    f"(opcional, solo para actualizaciones del pedido). "
+                    f"Responde *skip* si prefieres omitirlo."
+                    if session.language == "es" else
+                    f"Thanks, {first}! 😊 Last thing — what's your email? "
+                    f"(optional, just for order updates). "
+                    f"Reply *skip* if you'd rather skip it."
+                )
 
             elif current_field == CheckoutField.EMAIL:
                 session.collected.email = _extract_email(request.message)
                 session.status          = State.FINAL_CONFIRM
-                _refresh_system_prompt(session)
-                final_reply = strip_hallucinations(call_llm(llm, session.messages))
+                final_reply = _build_final_confirm_summary(session)
 
     elif session.status == State.FINAL_CONFIRM:
         confirmation = _classify_confirmation(llm, request.message)
@@ -1416,9 +1520,28 @@ async def chat_endpoint(request: ChatRequest):
                 )
                 session.collected.order_number = order_number
                 session.status                 = State.DONE
-                _refresh_system_prompt(session)
-                final_reply = strip_hallucinations(call_llm(llm, session.messages))
 
+                # ─── DETERMINISTIC closing reply — no LLM ──────────────────
+                first_name = c.full_name.split()[0] if c.full_name else (
+                    "amigo" if session.language == "es" else "friend"
+                )
+                total = session.cart.grand_total
+                if session.language == "es":
+                    final_reply = (
+                        f"¡Listo, {first_name}! 🎉 Tu pedido está confirmado.\n\n"
+                        f"📦 *Número de orden:* {order_number}\n"
+                        f"💰 *Total:* ${total:.2f}\n\n"
+                        f"¡Gracias por tu pedido y buen provecho! 🌮"
+                    )
+                else:
+                    final_reply = (
+                        f"You're all set, {first_name}! 🎉 Your order is confirmed.\n\n"
+                        f"📦 *Order number:* {order_number}\n"
+                        f"💰 *Total:* ${total:.2f}\n\n"
+                        f"Thank you for your order and enjoy your meal! 🌮"
+                    )
+
+                # Email notification (fire-and-forget)
                 if c.email:
                     try:
                         async with httpx.AsyncClient(timeout=10.0) as http:
@@ -1429,9 +1552,9 @@ async def chat_endpoint(request: ChatRequest):
                                     "from_name":      os.getenv("FROM_NAME","TenantOS"),
                                     "to":             [{"email": c.email, "name": c.full_name}],
                                     "subject":        f"Your order at {ctx.brand_name} is confirmed!",
-                                    "title":          f"Order confirmed, {c.full_name.split()[0]}!",
+                                    "title":          f"Order confirmed, {first_name}!",
                                     "body":           (
-                                        f"Hi {c.full_name.split()[0]},\n\nYour order has been confirmed!\n\n"
+                                        f"Hi {first_name},\n\nYour order has been confirmed!\n\n"
                                         f"{session.cart.to_display()}\n\n"
                                         f"Service: {c.service_type}\n"
                                         f"{'Delivery to: ' + c.address + chr(10) if c.service_type == 'delivery' else ''}"
@@ -1445,17 +1568,6 @@ async def chat_endpoint(request: ChatRequest):
                         logger.info(f"[email] sent to {c.email}")
                     except Exception as e:
                         logger.error(f"[email] failed: {e}")
-
-                total = session.cart.grand_total
-                closing_bad = ("correct","correcto","look good","everything","todo","?")
-                if not final_reply or any(t in final_reply.lower() for t in closing_bad):
-                    final_reply = (
-                        f"¡Listo, {c.full_name}! Tu pedido está confirmado. "
-                        f"Orden: {order_number}. Total: ${total:.2f}. ¡Gracias y buen provecho!"
-                        if session.language == "es" else
-                        f"You're all set, {c.full_name}! Order confirmed. "
-                        f"Order: {order_number}. Total: ${total:.2f}. Thank you and enjoy your meal!"
-                    )
 
             except Exception as e:
                 logger.error(f"[save] error: {e}")
@@ -1475,8 +1587,8 @@ async def chat_endpoint(request: ChatRequest):
                 "No problem! Let's go back. What would you like to change?"
             )
         else:
-            _refresh_system_prompt(session)
-            final_reply = strip_hallucinations(call_llm(llm, session.messages))
+            # Re-show the summary if customer didn't clearly confirm
+            final_reply = _build_final_confirm_summary(session)
 
     elif session.status == State.ORDER:
         avail = _get_available_services(session.tenant)
