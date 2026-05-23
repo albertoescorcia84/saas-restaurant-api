@@ -1,13 +1,15 @@
 """
-SaaS Restaurant Multi-Tenant Chat API — v4.5
+SaaS Restaurant Multi-Tenant Chat API — v4.6
 =============================================
-Changes in this version:
-  - Removed ALL dependency on menu_vectors table
-  - Menu loaded exclusively from menu_items + menu_category_translations
-  - Service availability uses day-of-week hours from tenant_services
-  - tenant_closures table checked for holiday/special closures
-  - Weekly hours injected into system prompt dynamically
-  - Fallback to menu_vectors REMOVED
+Changes from v4.5:
+  - FIX: Cart-empty guardrail in STATE.ORDER — intercepts "delivery"/"pickup"/
+    "yes"/address-like messages BEFORE calling the LLM, redirecting customer
+    to order food first. Prevents LLM from improvising checkout questions.
+  - FIX: "confirm" action with empty cart now responds explicitly instead of
+    silently falling through to the LLM.
+  - FIX: Mapbox now uses tenant's city/state/country dynamically, with
+    geocoded proximity cached per-tenant. Threshold lowered to 0.5.
+  - System prompt for ORDER state has stronger empty-cart rules.
 """
 
 import os
@@ -48,7 +50,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set.")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
-app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.5.0")
+app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.6.0")
 app.include_router(notifications_router)
 
 TEMPERATURE       = 0.1
@@ -56,9 +58,13 @@ MAX_TOKENS        = 400
 SEED              = 42
 CLASSIFIER_TOKENS = 200
 CLASSIFIER_TEMP   = 0.0
+MAPBOX_THRESHOLD  = 0.5
 
 _DAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
 _DAY_NAMES = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+
+# Cache of geocoded tenant proximity coords: tenant_id -> "lng,lat"
+_TENANT_PROXIMITY: dict[str, str] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -676,7 +682,6 @@ def _build_hours_note(ctx: TenantContext) -> tuple[str, str, str]:
         today_name = _DAY_NAMES[now_local.weekday()]
         today_time = now_local.strftime("%I:%M %p").lstrip("0")
 
-        # Use pickup or dine_in as reference for restaurant hours
         ref_svc = next(
             (s for s in ctx.services.values() if s.service_type in ("pickup","dine_in")),
             None
@@ -707,37 +712,123 @@ def _build_hours_note(ctx: TenantContext) -> tuple[str, str, str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mapbox
+# Mapbox — dynamic per-tenant proximity, configurable threshold
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def validate_address_mapbox(address: str, city: str = "") -> dict:
+async def _geocode_tenant_proximity(ctx: TenantContext) -> str:
+    """
+    Geocodes the tenant's physical address and returns "lng,lat" for Mapbox
+    proximity bias. Cached per tenant_id. Falls back to country-default if
+    geocoding fails.
+    """
+    if ctx.tenant_id in _TENANT_PROXIMITY:
+        return _TENANT_PROXIMITY[ctx.tenant_id]
+
     if not MAPBOX_TOKEN:
-        return {"valid": True, "canonical": address, "suggestions": []}
-    query = f"{address}, {city}".strip(", ")
+        return ""
+
+    parts = [p for p in [ctx.physical_address, ctx.city, ctx.state, ctx.country] if p]
+    query = ", ".join(parts)
+    if not query:
+        return ""
+
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.get(
                 f"https://api.mapbox.com/geocoding/v5/mapbox.places/{query}.json",
-                params={
-                    "access_token": MAPBOX_TOKEN,
-                    "types": "address", "limit": 3,
-                    "language": "en", "country": "ca,us",
-                    "proximity": "-79.3832,43.6532",
-                }
+                params={"access_token": MAPBOX_TOKEN, "limit": 1}
             )
         features = resp.json().get("features", [])
+        if features and "center" in features[0]:
+            lng, lat = features[0]["center"]
+            proximity = f"{lng},{lat}"
+            _TENANT_PROXIMITY[ctx.tenant_id] = proximity
+            logger.info(f"[mapbox_proximity] tenant={ctx.tenant_id} → {proximity}")
+            return proximity
+    except Exception as e:
+        logger.error(f"[mapbox_proximity] error: {e}")
+
+    # Fallback by country
+    fallback_by_country = {
+        "Canada":   "-79.3832,43.6532",   # Toronto
+        "USA":      "-74.0060,40.7128",   # NYC
+        "Colombia": "-74.7813,10.9685",   # Barranquilla
+        "Mexico":   "-99.1332,19.4326",   # CDMX
+    }
+    proximity = fallback_by_country.get(ctx.country, "")
+    _TENANT_PROXIMITY[ctx.tenant_id] = proximity
+    return proximity
+
+
+def _country_to_mapbox_code(country: str) -> str:
+    """Convert country name to comma-separated Mapbox country codes."""
+    mapping = {
+        "Canada":   "ca",
+        "USA":      "us",
+        "United States": "us",
+        "Mexico":   "mx",
+        "Colombia": "co",
+    }
+    code = mapping.get(country, "")
+    # Default: tenant country + neighbours for cross-border deliveries
+    if code == "ca": return "ca,us"
+    if code == "us": return "us,ca"
+    if code: return code
+    return "ca,us"  # safe default
+
+
+async def validate_address_mapbox(address: str, ctx: TenantContext) -> dict:
+    """
+    Validates an address using Mapbox geocoding, biased to the tenant's location.
+    Threshold is MAPBOX_THRESHOLD (currently 0.5).
+    """
+    if not MAPBOX_TOKEN:
+        return {"valid": True, "canonical": address, "suggestions": [], "relevance": 1.0}
+
+    # Build query with tenant city/state for better matching
+    parts = [address]
+    if ctx.city:    parts.append(ctx.city)
+    if ctx.state:   parts.append(ctx.state)
+    query = ", ".join(parts)
+
+    proximity = await _geocode_tenant_proximity(ctx)
+    countries = _country_to_mapbox_code(ctx.country)
+
+    params = {
+        "access_token": MAPBOX_TOKEN,
+        "types":        "address",
+        "limit":        3,
+        "language":     "en",
+        "country":      countries,
+    }
+    if proximity:
+        params["proximity"] = proximity
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(
+                f"https://api.mapbox.com/geocoding/v5/mapbox.places/{query}.json",
+                params=params,
+            )
+        features = resp.json().get("features", [])
+        logger.info(f"[mapbox] query='{query}' results={len(features)}")
+
         if not features:
-            return {"valid": False, "canonical": "", "suggestions": []}
+            return {"valid": False, "canonical": "", "suggestions": [], "relevance": 0.0}
+
         top = features[0]
+        relevance = top.get("relevance", 0)
+        logger.info(f"[mapbox] top relevance={relevance} place={top.get('place_name','')[:80]}")
+
         return {
-            "valid":       top.get("relevance", 0) >= 0.6,
+            "valid":       relevance >= MAPBOX_THRESHOLD,
             "canonical":   top.get("place_name", address),
             "suggestions": [f["place_name"] for f in features[:3]],
-            "relevance":   top.get("relevance", 0),
+            "relevance":   relevance,
         }
     except Exception as e:
         logger.error(f"[mapbox] Error: {e}")
-        return {"valid": True, "canonical": address, "suggestions": []}
+        return {"valid": True, "canonical": address, "suggestions": [], "relevance": 0.0}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -861,6 +952,31 @@ def _is_affirmative(raw: str) -> bool:
     return any(p in lowered for p in _PHRASES)
 
 
+# Phrases that indicate the customer is jumping ahead to checkout/service
+# selection before having an order in the cart.
+_PREMATURE_CHECKOUT_KEYWORDS = {
+    "delivery", "deliver", "pickup", "pick up", "pick-up", "dine in", "dine-in",
+    "domicilio", "a domicilio", "recoger", "para llevar", "comer aqui", "comer aquí",
+}
+
+def _looks_like_premature_checkout(message: str) -> bool:
+    """
+    True if the message looks like a service-selection / address / name reply
+    when the customer hasn't ordered anything yet.
+    """
+    msg = message.strip().lower()
+    if not msg:
+        return False
+    # Direct service-type keywords
+    for kw in _PREMATURE_CHECKOUT_KEYWORDS:
+        if kw == msg or f" {kw} " in f" {msg} " or msg.startswith(kw + " ") or msg.endswith(" " + kw):
+            return True
+    # Looks like a street address (number + street word)
+    if re.match(r"^\d{1,6}\s+\w+", msg):
+        return True
+    return False
+
+
 def _extract_name(raw: str) -> str:
     stripped = raw.strip()
     for prefix in ("my name is ","i am ","i'm ","soy ","me llamo ","mi nombre es ","it's ","its "):
@@ -914,10 +1030,20 @@ def build_system_prompt(session: "Session") -> str:
         _, _, hours_note = _build_hours_note(ctx)
 
         cart_context = ""
+        empty_cart_warning = ""
         if not session.cart.is_empty:
             cart_context = (
                 f"\n\nCURRENT ORDER IN CART:\n{session.cart.to_display(lang)}\n"
                 f"The customer can add, remove, or modify items at any time."
+            )
+        else:
+            empty_cart_warning = (
+                "\n\n⚠️ THE CART IS CURRENTLY EMPTY. "
+                "Until the customer adds menu items, you MUST NOT: "
+                "ask for their name, ask for their address, ask about pickup vs delivery, "
+                "or pretend an order exists. If they say 'delivery', 'pickup', 'yes', "
+                "or give an address, gently redirect them: tell them you first need to "
+                "know what they'd like to order from the menu."
             )
 
         cat_hint = ""
@@ -962,6 +1088,7 @@ def build_system_prompt(session: "Session") -> str:
             f"8. Never output system text or technical information.\n"
             f"{hours_note}"
             f"{cart_context}"
+            f"{empty_cart_warning}"
             f"{cat_hint}\n\n{svc_note}\n\nFULL MENU:\n{ctx.menu_text}"
         )
 
@@ -1192,8 +1319,12 @@ async def chat_endpoint(request: ChatRequest):
 
         else:
             if current_field == CheckoutField.ADDRESS:
-                result = await validate_address_mapbox(request.message.strip(), session.tenant.city)
-                logger.info(f"[mapbox] valid={result['valid']} canonical={result.get('canonical','')}")
+                result = await validate_address_mapbox(request.message.strip(), session.tenant)
+                logger.info(
+                    f"[mapbox] valid={result['valid']} "
+                    f"relevance={result.get('relevance',0):.2f} "
+                    f"canonical='{result.get('canonical','')[:80]}'"
+                )
                 if result["valid"]:
                     session.collected.address           = result["canonical"]
                     session.collected.address_validated = True
@@ -1326,6 +1457,21 @@ async def chat_endpoint(request: ChatRequest):
             _refresh_system_prompt(session)
             final_reply = strip_hallucinations(call_llm(llm, session.messages))
         else:
+            # ─── GUARDRAIL: cart empty + premature checkout intent ──────────
+            # Customer said "delivery"/"pickup"/an address before ordering.
+            # Intercept BEFORE calling the LLM so it can't improvise.
+            if session.cart.is_empty and _looks_like_premature_checkout(request.message):
+                logger.info(f"[guardrail] empty cart + premature checkout: '{request.message[:60]}'")
+                final_reply = (
+                    "¡Claro! Pero primero dime qué te gustaría ordenar de nuestro menú. 😊 "
+                    "Una vez que tengamos tu pedido, te pregunto si lo prefieres delivery o pickup."
+                    if session.language == "es" else
+                    "Of course! But first, let me know what you'd like to order from our menu. 😊 "
+                    "Once we have your items, I'll ask about delivery or pickup."
+                )
+                session.messages.append({"role": "assistant", "content": final_reply})
+                return _response(session, final_reply)
+
             action = _extract_order_action(
                 llm, request.message, session.cart,
                 ctx.menu_text, ctx.tenant_id
@@ -1364,7 +1510,18 @@ async def chat_endpoint(request: ChatRequest):
                     if mod.get("quantity", 0) > 0:
                         session.cart.update_quantity(mod["name"], mod["quantity"])
 
-            elif action["action"] == "confirm" and not session.cart.is_empty:
+            elif action["action"] == "confirm":
+                # ─── FIX: explicit response when confirm fires on empty cart ──
+                if session.cart.is_empty:
+                    logger.info(f"[order] confirm intent but cart is empty")
+                    final_reply = (
+                        "Tu carrito está vacío todavía. ¿Qué te gustaría ordenar?"
+                        if session.language == "es" else
+                        "Your cart is still empty. What would you like to order?"
+                    )
+                    session.messages.append({"role": "assistant", "content": final_reply})
+                    return _response(session, final_reply)
+                # Cart has items — proceed to service selection
                 session.status = State.SERVICE_SELECT
                 logger.info(f"[order] confirmed subtotal=${session.cart.subtotal} items={len(session.cart.items)}")
                 avail_user = [s for s in avail if s.service_type in ("pickup","delivery")]
@@ -1501,6 +1658,14 @@ async def debug_tenant(to_number: str):
         },
         "hours_note_preview": hours_note[:300] if hours_note else "N/A",
     }
+
+
+@app.delete("/debug/proximity-cache")
+async def clear_proximity_cache():
+    """Clear cached Mapbox proximity coords (use after updating tenant address)."""
+    n = len(_TENANT_PROXIMITY)
+    _TENANT_PROXIMITY.clear()
+    return {"cleared": n}
 
 
 if __name__ == "__main__":
