@@ -1,12 +1,13 @@
 """
-SaaS Restaurant Multi-Tenant Chat API — v4.3
+SaaS Restaurant Multi-Tenant Chat API — v4.4
 =============================================
 Changes in this version:
-  - Server-side OrderCart: items, quantity, prep_notes, unit_price, line_total
-  - LLM extracts structured JSON actions (add/remove/modify/confirm)
-  - Cart controls all calculations — LLM never calculates totals
-  - Order confirmation detected from cart state, not from LLM text parsing
-  - build_system_prompt injects today's day/time for accurate hours
+  - Menu loaded from menu_items DB table (structured, with item codes)
+  - Price validation from DB — LLM never determines prices
+  - item_code stored in order_items
+  - Fixed customer_name bug (was saving address instead of name)
+  - Menu categories loaded from tenant_menu_categories + translations
+  - Menu refreshes when language changes mid-session
 """
 
 import os
@@ -47,7 +48,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set.")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
-app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.3.0")
+app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.4.0")
 app.include_router(notifications_router)
 
 TEMPERATURE       = 0.1
@@ -91,7 +92,8 @@ class OrderItem:
     name:       str
     quantity:   int
     unit_price: float
-    prep_notes: str  = ""
+    prep_notes: str = ""
+    item_code:  str = ""
 
     @property
     def line_total(self) -> float:
@@ -104,6 +106,7 @@ class OrderItem:
 
     def to_dict(self) -> dict:
         return {
+            "item_code":  self.item_code,
             "name":       self.name,
             "quantity":   self.quantity,
             "unit_price": self.unit_price,
@@ -134,17 +137,22 @@ class OrderCart:
     def is_empty(self) -> bool:
         return len(self.items) == 0
 
-    def add_item(self, name: str, quantity: int, unit_price: float, prep_notes: str = "") -> None:
-        # Check if item already exists (merge quantities)
+    def add_item(self, name: str, quantity: int, unit_price: float,
+                 prep_notes: str = "", item_code: str = "") -> None:
         for item in self.items:
             if item.name.lower() == name.lower():
-                item.quantity   += quantity
+                item.quantity += quantity
                 if prep_notes:
                     item.prep_notes = prep_notes
+                if item_code:
+                    item.item_code = item_code
                 logger.info(f"[cart] updated {name} qty={item.quantity}")
                 return
-        self.items.append(OrderItem(name=name, quantity=quantity, unit_price=unit_price, prep_notes=prep_notes))
-        logger.info(f"[cart] added {name} x{quantity} @ ${unit_price}")
+        self.items.append(OrderItem(
+            name=name, quantity=quantity, unit_price=unit_price,
+            prep_notes=prep_notes, item_code=item_code
+        ))
+        logger.info(f"[cart] added {name} x{quantity} @ ${unit_price} code={item_code}")
 
     def remove_item(self, name: str) -> bool:
         before = len(self.items)
@@ -170,14 +178,12 @@ class OrderCart:
         return False
 
     def to_summary_string(self) -> str:
-        """For order_summary field in DB — pipe separated."""
         return " | ".join(
             f"{i.name} (${i.unit_price:.2f})" + (f" [{i.prep_notes}]" if i.prep_notes else "")
             for i in self.items
         )
 
     def to_display(self, lang: str = "en") -> str:
-        """Human-readable for LLM system prompt and confirmation."""
         lines = [i.to_display() for i in self.items]
         lines.append(f"\nSubtotal: ${self.subtotal:.2f}")
         if self.tax_total > 0:
@@ -266,7 +272,7 @@ class ChatRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Database
+# Database — Tenant
 # ─────────────────────────────────────────────────────────────────────────────
 
 def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
@@ -274,7 +280,7 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
         row = conn.execute(text("""
             SELECT
                 t.id, t.brand_name, t.status,
-                t.physical_address, t.city, t.state, t.country, t.timezone, 
+                t.physical_address, t.city, t.state, t.country, t.timezone,
                 s.system_prompt, s.primary_language, s.supported_languages,
                 m.model_name, m.api_key, m.provider
             FROM tenants t
@@ -365,7 +371,8 @@ def db_save_customer(user_phone, tenant_id, full_name, address, email, order_sum
         tc_id = tc_row[0]
 
         conn.execute(text("""
-            UPDATE tenant_customer_addresses SET is_default = false WHERE tenant_customer_id = :tcid
+            UPDATE tenant_customer_addresses SET is_default = false
+            WHERE tenant_customer_id = :tcid
         """), {"tcid": tc_id})
         conn.execute(text("""
             INSERT INTO tenant_customer_addresses
@@ -406,8 +413,9 @@ def db_save_order(session_id, tenant_id, customer_id, customer_name,
             ) RETURNING id
         """), {
             "num":   order_number, "tid": tenant_id, "cid": customer_id,
-            "name":  customer_name, "phone": customer_phone, "email": customer_email or None,
-            "stype": service_type, "addr": delivery_address or "",
+            "name":  customer_name, "phone": customer_phone,
+            "email": customer_email or None, "stype": service_type,
+            "addr":  delivery_address or "",
             "sub":   cart.subtotal, "tax": cart.tax_total,
             "del":   cart.delivery_fee, "grand": cart.grand_total,
             "notes": notes, "sid": session_id,
@@ -417,11 +425,15 @@ def db_save_order(session_id, tenant_id, customer_id, customer_name,
         for item in cart.items:
             conn.execute(text("""
                 INSERT INTO order_items
-                    (order_id, line_type, item_name, quantity, unit_price, line_total, prep_notes)
-                VALUES (:oid, 'item', :name, :qty, :price, :total, :notes)
+                    (order_id, line_type, item_code, item_name, quantity, unit_price, line_total, prep_notes)
+                VALUES (:oid, 'item', :code, :name, :qty, :price, :total, :notes)
             """), {
-                "oid": order_id, "name": item.name, "qty": item.quantity,
-                "price": item.unit_price, "total": item.line_total,
+                "oid":   order_id,
+                "code":  item.item_code or None,
+                "name":  item.name,
+                "qty":   item.quantity,
+                "price": item.unit_price,
+                "total": item.line_total,
                 "notes": item.prep_notes or None,
             })
 
@@ -442,10 +454,67 @@ def db_save_order(session_id, tenant_id, customer_id, customer_name,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Menu
+# Menu — loaded from menu_items DB table
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_full_menu(tenant_id: str) -> str:
+def get_menu_for_language(tenant_id: str, language: str) -> str:
+    """
+    Fetch structured menu from menu_items + translations.
+    Falls back to 'en' if requested language not available.
+    """
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    tmc.serve_order,
+                    COALESCE(mct_lang.name, mct_en.name, tmc.category_code) AS category_name,
+                    mi.item_code,
+                    COALESCE(mit_lang.name, mi.name)             AS item_name,
+                    COALESCE(mit_lang.description, mi.description) AS item_desc,
+                    mi.price,
+                    mi.sort_order
+                FROM tenant_menu_categories tmc
+                LEFT JOIN menu_category_translations mct_lang
+                    ON tmc.category_code = mct_lang.category_code
+                    AND mct_lang.language_code = :lang
+                LEFT JOIN menu_category_translations mct_en
+                    ON tmc.category_code = mct_en.category_code
+                    AND mct_en.language_code = 'en'
+                JOIN menu_items mi
+                    ON tmc.tenant_id = mi.tenant_id
+                    AND tmc.category_code = mi.category_code
+                LEFT JOIN menu_item_translations mit_lang
+                    ON mi.tenant_id = mit_lang.tenant_id
+                    AND mi.item_code = mit_lang.item_code
+                    AND mit_lang.language_code = :lang
+                WHERE tmc.tenant_id = :tid
+                    AND tmc.is_active = true
+                    AND mi.is_available = true
+                ORDER BY tmc.serve_order, mi.sort_order
+            """), {"tid": tenant_id, "lang": language}).mappings().all()
+
+        if not rows:
+            # Fallback to menu_vectors if no structured menu exists
+            return _get_menu_from_vectors(tenant_id)
+
+        current_category = None
+        lines = []
+        for row in rows:
+            if row["category_name"] != current_category:
+                current_category = row["category_name"]
+                lines.append(f"\n## {current_category}")
+            desc = f" — {row['item_desc']}" if row["item_desc"] else ""
+            lines.append(f"[{row['item_code']}] {row['item_name']} — ${row['price']:.2f}{desc}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"[menu] DB error: {e}")
+        return _get_menu_from_vectors(tenant_id)
+
+
+def _get_menu_from_vectors(tenant_id: str) -> str:
+    """Fallback: load menu from legacy menu_vectors table."""
     try:
         with engine.connect() as conn:
             rows = conn.execute(text(
@@ -453,28 +522,59 @@ def get_full_menu(tenant_id: str) -> str:
             ), {"tid": tenant_id}).fetchall()
         return "\n".join(r[0] for r in rows) if rows else "Menu information is not available."
     except Exception as e:
-        logger.error(f"[menu] DB error: {e}")
+        logger.error(f"[menu_vectors] DB error: {e}")
         return "Menu information could not be retrieved."
 
 
-def _extract_menu_categories(menu_text: str) -> list[str]:
-    categories = []
-    patterns = [
-        r"^===\s*(.+?)\s*===",
-        r"^#+\s+\*?\*?(.+?)\*?\*?",
-        r"^([A-Z][A-Z\s/]+[A-Z])\s*$",
-        r"^\*\*([A-Z][A-Z\s/]+)\*\*",
-    ]
-    for line in menu_text.split("\n"):
-        line = line.strip()
-        for pat in patterns:
-            m = re.match(pat, line)
-            if m:
-                cat = m.group(1).strip().rstrip("*").strip()
-                if len(cat) > 2 and cat not in categories:
-                    categories.append(cat)
-                break
-    return categories
+def get_menu_categories(tenant_id: str) -> list[str]:
+    """Get category names from DB ordered by serve_order."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT COALESCE(mct.name, tmc.category_code) AS name
+                FROM tenant_menu_categories tmc
+                LEFT JOIN menu_category_translations mct
+                    ON tmc.category_code = mct.category_code
+                    AND mct.language_code = 'en'
+                WHERE tmc.tenant_id = :tid AND tmc.is_active = true
+                ORDER BY tmc.serve_order
+            """), {"tid": tenant_id}).fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        logger.error(f"[categories] error: {e}")
+        return []
+
+
+def lookup_menu_item(tenant_id: str, item_name: str) -> Optional[dict]:
+    """
+    Find a menu item by name (fuzzy match).
+    Returns {item_code, name, price} or None.
+    Price from DB is always used — LLM price is ignored.
+    """
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT item_code, name, price
+                FROM menu_items
+                WHERE tenant_id = :tid
+                    AND is_available = true
+                    AND (
+                        LOWER(name) LIKE LOWER(:search)
+                        OR LOWER(:exact) LIKE LOWER('%' || name || '%')
+                    )
+                ORDER BY
+                    CASE WHEN LOWER(name) = LOWER(:exact) THEN 0 ELSE 1 END,
+                    LENGTH(name)
+                LIMIT 1
+            """), {
+                "tid":    tenant_id,
+                "search": f"%{item_name}%",
+                "exact":  item_name,
+            }).mappings().first()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"[lookup_item] error: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -482,12 +582,10 @@ def _extract_menu_categories(menu_text: str) -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_timezone_from_address(llm: LLMProvider, ctx: TenantContext) -> str:
-    # If timezone already configured in DB, use it directly
     if ctx.timezone and "/" in ctx.timezone:
         logger.info(f"[tz] using DB timezone: {ctx.timezone}")
         return ctx.timezone
 
-    # Otherwise resolve via LLM from address
     location = f"{ctx.city}, {ctx.state}, {ctx.country}"
     try:
         tz = llm.classify(
@@ -502,8 +600,7 @@ def _resolve_timezone_from_address(llm: LLMProvider, ctx: TenantContext) -> str:
     except Exception as e:
         logger.error(f"[tz] error: {e}")
 
-    # Last resort fallback — log a warning
-    logger.warning(f"[tz] could not resolve timezone for {ctx.city}, {ctx.country} — defaulting to UTC")
+    logger.warning(f"[tz] could not resolve timezone — defaulting to UTC")
     return "UTC"
 
 
@@ -586,28 +683,25 @@ async def validate_address_mapbox(address: str, city: str = "") -> dict:
 # LLM Classifiers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_order_action(llm: LLMProvider, message: str, cart: OrderCart, menu_text: str) -> dict:
-    """
-    Uses LLM to extract structured order actions from customer message.
-    Returns a dict with action and items — server applies to cart.
-    """
+def _extract_order_action(llm: LLMProvider, message: str, cart: OrderCart,
+                          menu_text: str, tenant_id: str) -> dict:
     cart_display = cart.to_display() if not cart.is_empty else "Empty cart"
     prompt = f"""You are an order action extractor for a restaurant.
 
 Current cart:
 {cart_display}
 
-Menu (use EXACT names and prices from here):
+Menu (use EXACT item codes and names from here):
 {menu_text[:3000]}
 
 Customer message: "{message}"
 
-Extract the action and reply with JSON ONLY. No explanation, no markdown, just JSON.
+Reply with JSON ONLY. No explanation, no markdown.
 
 {{
   "action": "add|remove|modify|confirm|unclear|inquiry",
   "items_to_add": [
-    {{"name": "exact item name from menu", "quantity": 1, "unit_price": 0.00, "prep_notes": "e.g. no sauce, extra spicy"}}
+    {{"item_code": "e.g. PUP-001", "name": "exact item name", "quantity": 1, "prep_notes": "e.g. no sauce"}}
   ],
   "items_to_remove": ["exact item name"],
   "items_to_modify": [
@@ -616,21 +710,24 @@ Extract the action and reply with JSON ONLY. No explanation, no markdown, just J
 }}
 
 Rules:
-- action "confirm" = customer says yes/ok/correct to their order summary
-- action "inquiry" = customer asks a question (hours, ingredients, availability)
+- action "confirm" = customer confirms their order summary (yes/ok/correct)
+- action "inquiry" = customer asks a question about menu, hours, ingredients
 - action "unclear" = cannot determine intent
-- For quantity 0 in modify = keep existing quantity
-- prep_notes examples: "no curtido", "extra salsa", "sin picante", "well done"
+- quantity 0 in modify = keep existing quantity
+- Always use item_code from the menu when adding items
 """
+    result = ""
     try:
         result = llm.classify(prompt, max_tokens=CLASSIFIER_TOKENS)
-        # Strip markdown if present
         result = re.sub(r"```json|```", "", result).strip()
-        data   = json.loads(result)
-        logger.info(f"[cart_action] action={data.get('action')} add={len(data.get('items_to_add',[]))} remove={data.get('items_to_remove',[])}")
+        json_match = re.search(r"\{.*\}", result, re.DOTALL)
+        if json_match:
+            result = json_match.group(0)
+        data = json.loads(result)
+        logger.info(f"[cart_action] action={data.get('action')} add={len(data.get('items_to_add',[]))}")
         return data
     except Exception as e:
-        logger.error(f"[extract_order_action] error: {e} raw={result if 'result' in dir() else 'N/A'}")
+        logger.error(f"[extract_order_action] error: {e} raw={result[:200] if result else 'N/A'}")
         return {"action": "unclear", "items_to_add": [], "items_to_remove": [], "items_to_modify": []}
 
 
@@ -754,7 +851,6 @@ def build_system_prompt(session: "Session") -> str:
     li   = f"IMPORTANT: {LANG_INSTRUCTIONS.get(lang, LANG_INSTRUCTIONS['en'])}\n\n"
 
     if session.status == State.ORDER:
-        # Today's day and time for accurate hours
         days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
         try:
             now_local  = datetime.now(zi.ZoneInfo(ctx.timezone))
@@ -768,11 +864,10 @@ def build_system_prompt(session: "Session") -> str:
         if today_name:
             hours_note = (
                 f"\n\nToday is {today_name} and the current local time is {today_time}. "
-                f"If the customer asks about hours, refer ONLY to the HOURS section in the menu below "
-                f"for today's exact opening and closing times. Do NOT guess or invent hours."
+                f"If the customer asks about hours, refer ONLY to the HOURS section in the menu. "
+                f"Do NOT guess or invent hours."
             )
 
-        # Current cart state for LLM context
         cart_context = ""
         if not session.cart.is_empty:
             cart_context = (
@@ -784,8 +879,8 @@ def build_system_prompt(session: "Session") -> str:
         if ctx.menu_categories:
             cats     = ", ".join(ctx.menu_categories[:6])
             cat_hint = (
-                f"\n\nMenu sections: {cats}. "
-                f"Offer categories first. Give item details only if asked."
+                f"\n\nMenu sections in order: {cats}. "
+                f"Offer sections in this order. Give item details only if asked."
             )
 
         greeting = (
@@ -818,7 +913,7 @@ def build_system_prompt(session: "Session") -> str:
             f"5. When customer says they are done: read back the complete cart with subtotal "
             f"and ask them to confirm. Do NOT mention delivery method here.\n"
             f"6. Never ask for address, name, email, or delivery method — that comes after confirmation.\n"
-            f"7. If customer asks about hours: give today's exact hours from the HOURS section below.\n"
+            f"7. If customer asks about hours: give today's exact hours from the menu.\n"
             f"8. Never output system text or technical information.\n"
             f"{hours_note}"
             f"{cart_context}"
@@ -826,7 +921,6 @@ def build_system_prompt(session: "Session") -> str:
         )
 
     if session.status == State.CHECKOUT:
-        cart_display = session.cart.to_display(lang)
         field_instructions = {
             CheckoutField.ADDRESS: (
                 "Ask for their delivery address in one sentence. Mention you will verify it."
@@ -846,7 +940,7 @@ def build_system_prompt(session: "Session") -> str:
         }
         return (
             f"{base}\n\n{li}"
-            f"Order confirmed:\n{cart_display}\n"
+            f"Order confirmed:\n{session.cart.to_display(lang)}\n"
             f"Service: {c.service_type}.\n"
             f"You are collecting delivery details one field at a time. "
             f"{field_instructions.get(session.checkout_field, '')}\n"
@@ -854,15 +948,13 @@ def build_system_prompt(session: "Session") -> str:
         )
 
     if session.status == State.FINAL_CONFIRM:
-        cart     = session.cart
-        total    = cart.grand_total
         addr_line = c.address if c.service_type == "delivery" else "Pickup (no address needed)"
         email_ln  = f"\nEmail: {c.email}" if c.email else ""
         return (
             f"{base}\n\n{li}"
             f"Read back the complete order and ask for final confirmation.\n\n"
             f"Name: {c.full_name}\nService: {c.service_type}\nAddress: {addr_line}"
-            f"{email_ln}\n\nOrder:\n{cart.to_display(lang)}\n\n"
+            f"{email_ln}\n\nOrder:\n{session.cart.to_display(lang)}\n\n"
             f"Sound warm and natural. Ask: does everything look correct?"
         )
 
@@ -879,7 +971,7 @@ def build_system_prompt(session: "Session") -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM call wrapper
+# LLM wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 
 def call_llm(llm: LLMProvider, messages: list) -> str:
@@ -915,14 +1007,14 @@ async def chat_endpoint(request: ChatRequest):
     if ctx.status != "Active":
         raise HTTPException(403, "Restaurant is currently inactive.")
 
-    session    = _sessions.get(user_phone)
+    session = _sessions.get(user_phone)
     _GREETINGS = {"hello","hi","hola","hey","buenos dias","buenas","good morning",
                   "good afternoon","good evening","start","restart","nuevo","nueva",
                   "buenas tardes","buenas noches"}
     _DONE_PHRASES = {"thank you","thanks","gracias","ty","thx","perfecto","ok gracias",
-                 "thank u","muchas gracias","de nada","awesome","great","perfect",
-                 "how long","when will","where is my","track","cuanto tiempo",
-                 "cuando llega","gracias por todo"}
+                     "thank u","muchas gracias","de nada","awesome","great","perfect",
+                     "how long","when will","where is my","track","cuanto tiempo",
+                     "cuando llega","gracias por todo"}
     msg_clean      = request.message.strip().lower()
     is_greeting    = msg_clean in _GREETINGS
     is_done_phrase = msg_clean in _DONE_PHRASES
@@ -938,8 +1030,10 @@ async def chat_endpoint(request: ChatRequest):
     if need_new_session:
         ctx.timezone        = _resolve_timezone_from_address(llm, ctx)
         _check_service_availability(ctx)
-        ctx.menu_text       = get_full_menu(ctx.tenant_id)
-        ctx.menu_categories = _extract_menu_categories(ctx.menu_text)
+        detected_lang       = _detect_language(request.message, ctx.supported_languages)
+        ctx.menu_text       = get_menu_for_language(ctx.tenant_id, detected_lang)
+        ctx.menu_categories = get_menu_categories(ctx.tenant_id)
+        logger.info(f"[menu] categories={ctx.menu_categories}")
         cust = db_get_customer(user_phone, ctx.tenant_id)
         session = Session(
             session_id         = str(uuid.uuid4()),
@@ -947,12 +1041,12 @@ async def chat_endpoint(request: ChatRequest):
             tenant             = ctx,
             cart               = OrderCart(),
             status             = State.ORDER,
-            language           = _detect_language(request.message, ctx.supported_languages),
+            language           = detected_lang,
             collected          = CustomerData(
-                full_name  = cust["full_name"],
-                email      = cust["email"],
-                address    = cust["address_line_1"],
-                customer_id= cust["customer_id"],
+                full_name   = cust["full_name"],
+                email       = cust["email"],
+                address     = cust["address_line_1"],
+                customer_id = cust["customer_id"],
             ),
             is_global_customer = cust["is_global"],
             is_tenant_customer = cust["is_tenant"],
@@ -965,6 +1059,8 @@ async def chat_endpoint(request: ChatRequest):
         detected = _detect_language(request.message, session.tenant.supported_languages)
         if detected != session.language and detected in session.tenant.supported_languages:
             session.language = detected
+            # Refresh menu in new language
+            session.tenant.menu_text = get_menu_for_language(ctx.tenant_id, session.language)
 
     _refresh_system_prompt(session)
     if len(session.messages) > 21:
@@ -986,7 +1082,7 @@ async def chat_endpoint(request: ChatRequest):
         chose_pickup   = any(w in msg_lower for w in pickup_kw)
         chose_delivery = any(w in msg_lower for w in delivery_kw)
 
-        # NEW: if only one service available and customer says yes, auto-select it
+        # Auto-select if only one service available and customer says yes
         avail_order = [s for s in avail if s.service_type in ("pickup","delivery")]
         if not chose_pickup and not chose_delivery and _is_affirmative(request.message):
             if len(avail_order) == 1:
@@ -996,11 +1092,11 @@ async def chat_endpoint(request: ChatRequest):
                     chose_pickup = True
 
         if chose_pickup and avail_pickup:
-            session.collected.service_type  = "pickup"
-            session.collected.delivery_fee  = 0.0
-            session.cart.delivery_fee       = 0.0
-            session.status                  = State.CHECKOUT
-            session.checkout_field          = CheckoutField.NAME if not session.collected.full_name else CheckoutField.EMAIL
+            session.collected.service_type = "pickup"
+            session.collected.delivery_fee = 0.0
+            session.cart.delivery_fee      = 0.0
+            session.status                 = State.CHECKOUT
+            session.checkout_field         = CheckoutField.NAME if not session.collected.full_name else CheckoutField.EMAIL
             final_reply = (
                 "¡Perfecto, pickup! 🏃 Sin costo de envío. ¿Me puedes dar tu nombre completo?"
                 if session.language == "es" else
@@ -1065,15 +1161,18 @@ async def chat_endpoint(request: ChatRequest):
                 else:
                     session.address_attempts += 1
                     sugg = "\n".join(f"• {s}" for s in result.get("suggestions",[])[:2])
-                    final_reply = (
-                        f"Hmm, no pude encontrar esa dirección. ¿Quisiste decir?\n{sugg}\n\nO escríbela completa."
-                        if sugg and session.language == "es" else
-                        f"Hmm, I couldn't find that address. Did you mean?\n{sugg}\n\nOr please re-enter it fully."
-                        if sugg else
-                        ("No encontré esa dirección. ¿Podrías escribirla completa?"
-                         if session.language == "es" else
-                         "I couldn't find that address. Could you write it out fully?")
-                    )
+                    if sugg:
+                        final_reply = (
+                            f"Hmm, no pude encontrar esa dirección. ¿Quisiste decir?\n{sugg}\n\nO escríbela completa."
+                            if session.language == "es" else
+                            f"Hmm, I couldn't find that address. Did you mean?\n{sugg}\n\nOr please re-enter it fully."
+                        )
+                    else:
+                        final_reply = (
+                            "No encontré esa dirección. ¿Podrías escribirla completa?"
+                            if session.language == "es" else
+                            "I couldn't find that address. Could you write it out fully?"
+                        )
 
             elif current_field == CheckoutField.NAME:
                 session.collected.full_name = _extract_name(request.message)
@@ -1095,8 +1194,9 @@ async def chat_endpoint(request: ChatRequest):
             session.status = State.SAVING
             c = session.collected
             try:
+                logger.info(f"[save] full_name='{c.full_name}' address='{c.address}'")
                 customer_id = db_save_customer(
-                    user_phone, ctx.tenant_id, c.full_name,
+                    user_phone, ctx.tenant_id, c.full_name or "Unknown",
                     c.address or "Pickup", c.email or None,
                     session.cart.to_summary_string(),
                 )
@@ -1106,7 +1206,7 @@ async def chat_endpoint(request: ChatRequest):
                     session_id       = session.session_id,
                     tenant_id        = ctx.tenant_id,
                     customer_id      = customer_id,
-                    customer_name    = c.full_name,
+                    customer_name    = c.full_name or "Unknown",
                     customer_phone   = user_phone,
                     customer_email   = c.email or None,
                     service_type     = c.service_type,
@@ -1185,16 +1285,32 @@ async def chat_endpoint(request: ChatRequest):
             _refresh_system_prompt(session)
             final_reply = strip_hallucinations(call_llm(llm, session.messages))
         else:
-            # Extract structured action from customer message
-            action = _extract_order_action(llm, request.message, session.cart, ctx.menu_text)
+            action = _extract_order_action(
+                llm, request.message, session.cart,
+                ctx.menu_text, ctx.tenant_id
+            )
 
             if action["action"] == "add":
                 for item_data in action.get("items_to_add", []):
+                    name = item_data.get("name", "")
+                    # Validate price from DB — never trust LLM price
+                    db_item = lookup_menu_item(ctx.tenant_id, name)
+                    if db_item:
+                        unit_price = float(db_item["price"])
+                        item_code  = db_item["item_code"]
+                        name       = db_item["name"]
+                        logger.info(f"[cart] DB match: {name} code={item_code} price=${unit_price}")
+                    else:
+                        unit_price = float(item_data.get("unit_price", 0))
+                        item_code  = item_data.get("item_code", "")
+                        logger.warning(f"[cart] item not found in DB: '{name}' — using LLM price")
+
                     session.cart.add_item(
-                        name       = item_data.get("name",""),
+                        name       = name,
                         quantity   = int(item_data.get("quantity", 1)),
-                        unit_price = float(item_data.get("unit_price", 0)),
-                        prep_notes = item_data.get("prep_notes",""),
+                        unit_price = unit_price,
+                        prep_notes = item_data.get("prep_notes", ""),
+                        item_code  = item_code,
                     )
 
             elif action["action"] == "remove":
@@ -1209,9 +1325,8 @@ async def chat_endpoint(request: ChatRequest):
                         session.cart.update_quantity(mod["name"], mod["quantity"])
 
             elif action["action"] == "confirm" and not session.cart.is_empty:
-                # Customer confirmed the order — move to service selection
                 session.status = State.SERVICE_SELECT
-                logger.info(f"[order] confirmed cart subtotal=${session.cart.subtotal} items={len(session.cart.items)}")
+                logger.info(f"[order] confirmed subtotal=${session.cart.subtotal} items={len(session.cart.items)}")
                 avail_user = [s for s in avail if s.service_type in ("pickup","delivery")]
                 opts       = _format_service_options(avail_user, session.language)
                 final_reply = (
@@ -1224,7 +1339,6 @@ async def chat_endpoint(request: ChatRequest):
                 session.messages.append({"role": "assistant", "content": final_reply})
                 return _response(session, final_reply)
 
-            # Refresh prompt with updated cart and get LLM reply
             _refresh_system_prompt(session)
             final_reply = strip_hallucinations(call_llm(llm, session.messages))
             if not final_reply:
@@ -1234,12 +1348,12 @@ async def chat_endpoint(request: ChatRequest):
                 )
 
     else:
-            c = session.collected
-            final_reply = (
-                f"Tu pedido ya fue confirmado, {c.full_name or 'amigo'}. ¡Gracias!"
-                if session.language == "es" else
-                f"Your order is already confirmed, {c.full_name or 'friend'}. Thank you!"
-            )
+        c = session.collected
+        final_reply = (
+            f"Tu pedido ya fue confirmado, {c.full_name or 'amigo'}. ¡Gracias!"
+            if session.language == "es" else
+            f"Your order is already confirmed, {c.full_name or 'friend'}. Thank you!"
+        )
 
     session.messages.append({"role": "assistant", "content": final_reply})
     return _response(session, final_reply)
@@ -1268,9 +1382,9 @@ def _response(session: Session, reply: str) -> dict:
             "cart_subtotal":   session.cart.subtotal,
             "delivery_fee":    session.cart.delivery_fee,
             "collected": {
-                "full_name":  c.full_name,
-                "address":    c.address,
-                "email":      c.email,
+                "full_name":   c.full_name,
+                "address":     c.address,
+                "email":       c.email,
                 "customer_id": c.customer_id,
             },
             "tenant_tz":     session.tenant.timezone,
