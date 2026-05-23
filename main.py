@@ -1,13 +1,13 @@
 """
-SaaS Restaurant Multi-Tenant Chat API — v4.4
+SaaS Restaurant Multi-Tenant Chat API — v4.5
 =============================================
 Changes in this version:
-  - Menu loaded from menu_items DB table (structured, with item codes)
-  - Price validation from DB — LLM never determines prices
-  - item_code stored in order_items
-  - Fixed customer_name bug (was saving address instead of name)
-  - Menu categories loaded from tenant_menu_categories + translations
-  - Menu refreshes when language changes mid-session
+  - Removed ALL dependency on menu_vectors table
+  - Menu loaded exclusively from menu_items + menu_category_translations
+  - Service availability uses day-of-week hours from tenant_services
+  - tenant_closures table checked for holiday/special closures
+  - Weekly hours injected into system prompt dynamically
+  - Fallback to menu_vectors REMOVED
 """
 
 import os
@@ -48,7 +48,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set.")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
-app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.4.0")
+app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.5.0")
 app.include_router(notifications_router)
 
 TEMPERATURE       = 0.1
@@ -56,6 +56,9 @@ MAX_TOKENS        = 400
 SEED              = 42
 CLASSIFIER_TOKENS = 200
 CLASSIFIER_TEMP   = 0.0
+
+_DAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+_DAY_NAMES = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,7 +87,7 @@ class ServiceType(str, Enum):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Order Cart — server-side, never delegated to LLM
+# Order Cart
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -165,7 +168,6 @@ class OrderCart:
         for item in self.items:
             if name.lower() in item.name.lower():
                 item.prep_notes = notes
-                logger.info(f"[cart] notes updated for '{name}': {notes}")
                 return True
         return False
 
@@ -173,7 +175,6 @@ class OrderCart:
         for item in self.items:
             if name.lower() in item.name.lower():
                 item.quantity = quantity
-                logger.info(f"[cart] qty updated for '{name}': {quantity}")
                 return True
         return False
 
@@ -207,9 +208,8 @@ class ServiceInfo:
     is_active:    bool
     fee_type:     str
     fee_amount:   float
-    open_time:    time
-    close_time:   time
     is_open_now:  bool = False
+    hours_by_day: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -290,8 +290,16 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
         """), {"ph": to_number}).mappings().first()
         if not row:
             return None
+
         svc_rows = conn.execute(text("""
-            SELECT service_type, is_active, fee_type, fee_amount, open_time, close_time
+            SELECT service_type, is_active, fee_type, fee_amount,
+                   monday_open, monday_close,
+                   tuesday_open, tuesday_close,
+                   wednesday_open, wednesday_close,
+                   thursday_open, thursday_close,
+                   friday_open, friday_close,
+                   saturday_open, saturday_close,
+                   sunday_open, sunday_close
             FROM tenant_services WHERE tenant_id = :tid
         """), {"tid": row["id"]}).mappings().all()
 
@@ -312,13 +320,16 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
         supported_languages = [l.strip() for l in (row["supported_languages"] or "en").split(",")],
     )
     for s in svc_rows:
+        hours = {
+            day: {"open": s[f"{day}_open"], "close": s[f"{day}_close"]}
+            for day in _DAYS
+        }
         ctx.services[s["service_type"]] = ServiceInfo(
             service_type = s["service_type"],
             is_active    = s["is_active"],
             fee_type     = s["fee_type"],
             fee_amount   = float(s["fee_amount"] or 0),
-            open_time    = s["open_time"],
-            close_time   = s["close_time"],
+            hours_by_day = hours,
         )
     return ctx
 
@@ -412,12 +423,12 @@ def db_save_order(session_id, tenant_id, customer_id, customer_name,
                 :stype, :addr, :sub, :tax, 0, :del, :grand, :notes, :sid
             ) RETURNING id
         """), {
-            "num":   order_number, "tid": tenant_id, "cid": customer_id,
-            "name":  customer_name, "phone": customer_phone,
+            "num": order_number, "tid": tenant_id, "cid": customer_id,
+            "name": customer_name, "phone": customer_phone,
             "email": customer_email or None, "stype": service_type,
-            "addr":  delivery_address or "",
-            "sub":   cart.subtotal, "tax": cart.tax_total,
-            "del":   cart.delivery_fee, "grand": cart.grand_total,
+            "addr": delivery_address or "",
+            "sub": cart.subtotal, "tax": cart.tax_total,
+            "del": cart.delivery_fee, "grand": cart.grand_total,
             "notes": notes, "sid": session_id,
         }).fetchone()
         order_id = row[0]
@@ -428,12 +439,9 @@ def db_save_order(session_id, tenant_id, customer_id, customer_name,
                     (order_id, line_type, item_code, item_name, quantity, unit_price, line_total, prep_notes)
                 VALUES (:oid, 'item', :code, :name, :qty, :price, :total, :notes)
             """), {
-                "oid":   order_id,
-                "code":  item.item_code or None,
-                "name":  item.name,
-                "qty":   item.quantity,
-                "price": item.unit_price,
-                "total": item.line_total,
+                "oid": order_id, "code": item.item_code or None,
+                "name": item.name, "qty": item.quantity,
+                "price": item.unit_price, "total": item.line_total,
                 "notes": item.prep_notes or None,
             })
 
@@ -454,14 +462,10 @@ def db_save_order(session_id, tenant_id, customer_id, customer_name,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Menu — loaded from menu_items DB table
+# Menu — exclusively from menu_items DB table
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_menu_for_language(tenant_id: str, language: str) -> str:
-    """
-    Fetch structured menu from menu_items + translations.
-    Falls back to 'en' if requested language not available.
-    """
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
@@ -469,7 +473,7 @@ def get_menu_for_language(tenant_id: str, language: str) -> str:
                     tmc.serve_order,
                     COALESCE(mct_lang.name, mct_en.name, tmc.category_code) AS category_name,
                     mi.item_code,
-                    COALESCE(mit_lang.name, mi.name)             AS item_name,
+                    COALESCE(mit_lang.name, mi.name)              AS item_name,
                     COALESCE(mit_lang.description, mi.description) AS item_desc,
                     mi.price,
                     mi.sort_order
@@ -494,8 +498,8 @@ def get_menu_for_language(tenant_id: str, language: str) -> str:
             """), {"tid": tenant_id, "lang": language}).mappings().all()
 
         if not rows:
-            # Fallback to menu_vectors if no structured menu exists
-            return _get_menu_from_vectors(tenant_id)
+            logger.warning(f"[menu] No items found for tenant {tenant_id}")
+            return "Menu information is not available."
 
         current_category = None
         lines = []
@@ -510,24 +514,10 @@ def get_menu_for_language(tenant_id: str, language: str) -> str:
 
     except Exception as e:
         logger.error(f"[menu] DB error: {e}")
-        return _get_menu_from_vectors(tenant_id)
-
-
-def _get_menu_from_vectors(tenant_id: str) -> str:
-    """Fallback: load menu from legacy menu_vectors table."""
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text(
-                "SELECT content FROM menu_vectors WHERE tenant_id = :tid ORDER BY id"
-            ), {"tid": tenant_id}).fetchall()
-        return "\n".join(r[0] for r in rows) if rows else "Menu information is not available."
-    except Exception as e:
-        logger.error(f"[menu_vectors] DB error: {e}")
         return "Menu information could not be retrieved."
 
 
 def get_menu_categories(tenant_id: str) -> list[str]:
-    """Get category names from DB ordered by serve_order."""
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
@@ -546,11 +536,6 @@ def get_menu_categories(tenant_id: str) -> list[str]:
 
 
 def lookup_menu_item(tenant_id: str, item_name: str) -> Optional[dict]:
-    """
-    Find a menu item by name (fuzzy match).
-    Returns {item_code, name, price} or None.
-    Price from DB is always used — LLM price is ignored.
-    """
     try:
         with engine.connect() as conn:
             row = conn.execute(text("""
@@ -566,11 +551,7 @@ def lookup_menu_item(tenant_id: str, item_name: str) -> Optional[dict]:
                     CASE WHEN LOWER(name) = LOWER(:exact) THEN 0 ELSE 1 END,
                     LENGTH(name)
                 LIMIT 1
-            """), {
-                "tid":    tenant_id,
-                "search": f"%{item_name}%",
-                "exact":  item_name,
-            }).mappings().first()
+            """), {"tid": tenant_id, "search": f"%{item_name}%", "exact": item_name}).mappings().first()
         return dict(row) if row else None
     except Exception as e:
         logger.error(f"[lookup_item] error: {e}")
@@ -578,14 +559,13 @@ def lookup_menu_item(tenant_id: str, item_name: str) -> Optional[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Timezone & Service availability
+# Timezone & Service availability (day-of-week aware)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_timezone_from_address(llm: LLMProvider, ctx: TenantContext) -> str:
     if ctx.timezone and "/" in ctx.timezone:
         logger.info(f"[tz] using DB timezone: {ctx.timezone}")
         return ctx.timezone
-
     location = f"{ctx.city}, {ctx.state}, {ctx.country}"
     try:
         tz = llm.classify(
@@ -599,24 +579,60 @@ def _resolve_timezone_from_address(llm: LLMProvider, ctx: TenantContext) -> str:
             return tz
     except Exception as e:
         logger.error(f"[tz] error: {e}")
-
     logger.warning(f"[tz] could not resolve timezone — defaulting to UTC")
     return "UTC"
 
 
 def _check_service_availability(ctx: TenantContext) -> None:
     try:
-        now = datetime.now(zi.ZoneInfo(ctx.timezone)).time()
+        tz     = zi.ZoneInfo(ctx.timezone)
+        now_dt = datetime.now(tz)
+        now    = now_dt.time()
+        today  = _DAYS[now_dt.weekday()]
     except Exception:
-        now = datetime.utcnow().time()
+        now_dt = datetime.utcnow()
+        now    = now_dt.time()
+        today  = _DAYS[now_dt.weekday()]
+
+    # Check tenant_closures
+    closed_today = False
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT id FROM tenant_closures
+                WHERE tenant_id = :tid AND closed_date = CURRENT_DATE
+                LIMIT 1
+            """), {"tid": ctx.tenant_id}).fetchone()
+            closed_today = row is not None
+    except Exception as e:
+        logger.error(f"[closures] error: {e}")
+
     for svc in ctx.services.values():
         if not svc.is_active:
             svc.is_open_now = False
-        elif svc.close_time > svc.open_time:
-            svc.is_open_now = svc.open_time <= now <= svc.close_time
+            continue
+
+        if closed_today:
+            svc.is_open_now = False
+            logger.info(f"[svc] {svc.service_type}: closed today (closure record)")
+            continue
+
+        day_hours = svc.hours_by_day.get(today, {})
+        day_open  = day_hours.get("open")
+        day_close = day_hours.get("close")
+
+        if day_open is None or day_close is None:
+            svc.is_open_now = False
+            logger.info(f"[svc] {svc.service_type}: closed on {today} (no hours)")
+            continue
+
+        if day_close > day_open:
+            svc.is_open_now = day_open <= now <= day_close
         else:
-            svc.is_open_now = now >= svc.open_time or now <= svc.close_time
-        logger.info(f"[svc] {svc.service_type}: active={svc.is_active} open={svc.is_open_now} now={now}")
+            svc.is_open_now = now >= day_open or now <= day_close
+
+        logger.info(f"[svc] {svc.service_type}: open={svc.is_open_now} "
+                    f"({today} {day_open}-{day_close} now={now.strftime('%H:%M')})")
 
 
 def _get_available_services(ctx: TenantContext) -> list[ServiceInfo]:
@@ -643,6 +659,51 @@ def _format_service_options(services: list[ServiceInfo], lang: str) -> str:
                 else f"🛵 *Delivery* — delivered to your door ({fee_str})"
             )
     return "\n".join(options)
+
+
+def _build_hours_note(ctx: TenantContext) -> tuple[str, str, str]:
+    """
+    Returns (today_name, today_time, hours_note) built from tenant_services hours_by_day.
+    Uses pickup or dine_in service as reference for restaurant hours.
+    """
+    today_name = ""
+    today_time = ""
+    hours_note = ""
+    try:
+        tz        = zi.ZoneInfo(ctx.timezone)
+        now_local = datetime.now(tz)
+        today_key = _DAYS[now_local.weekday()]
+        today_name = _DAY_NAMES[now_local.weekday()]
+        today_time = now_local.strftime("%I:%M %p").lstrip("0")
+
+        # Use pickup or dine_in as reference for restaurant hours
+        ref_svc = next(
+            (s for s in ctx.services.values() if s.service_type in ("pickup","dine_in")),
+            None
+        )
+        if ref_svc:
+            hours_lines = []
+            for i, day_key in enumerate(_DAYS):
+                dh = ref_svc.hours_by_day.get(day_key, {})
+                o  = dh.get("open")
+                c  = dh.get("close")
+                if o and c:
+                    def fmt(t):
+                        return datetime.combine(now_local.date(), t).strftime("%I:%M %p").lstrip("0")
+                    hours_lines.append(f"{_DAY_NAMES[i]}: {fmt(o)} – {fmt(c)}")
+                else:
+                    hours_lines.append(f"{_DAY_NAMES[i]}: Closed")
+
+            hours_str  = "\n".join(hours_lines)
+            hours_note = (
+                f"\n\nToday is {today_name} and the current local time is {today_time}.\n"
+                f"Our weekly hours are:\n{hours_str}\n"
+                f"Use ONLY these hours if the customer asks. Do NOT guess or invent hours."
+            )
+    except Exception as e:
+        logger.error(f"[hours_note] error: {e}")
+
+    return today_name, today_time, hours_note
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -691,7 +752,7 @@ def _extract_order_action(llm: LLMProvider, message: str, cart: OrderCart,
 Current cart:
 {cart_display}
 
-Menu (use EXACT item codes and names from here):
+Menu (use EXACT item codes and names):
 {menu_text[:3000]}
 
 Customer message: "{message}"
@@ -710,11 +771,10 @@ Reply with JSON ONLY. No explanation, no markdown.
 }}
 
 Rules:
-- action "confirm" = customer confirms their order summary (yes/ok/correct)
-- action "inquiry" = customer asks a question about menu, hours, ingredients
-- action "unclear" = cannot determine intent
-- quantity 0 in modify = keep existing quantity
-- Always use item_code from the menu when adding items
+- action "confirm" = customer confirms order (yes/ok/correct/that's everything)
+- action "inquiry" = question about menu, hours, ingredients
+- action "unclear" = cannot determine
+- quantity 0 in modify = keep existing
 """
     result = ""
     try:
@@ -851,22 +911,7 @@ def build_system_prompt(session: "Session") -> str:
     li   = f"IMPORTANT: {LANG_INSTRUCTIONS.get(lang, LANG_INSTRUCTIONS['en'])}\n\n"
 
     if session.status == State.ORDER:
-        days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-        try:
-            now_local  = datetime.now(zi.ZoneInfo(ctx.timezone))
-            today_name = days[now_local.weekday()]
-            today_time = now_local.strftime("%I:%M %p")
-        except Exception:
-            today_name = ""
-            today_time = ""
-
-        hours_note = ""
-        if today_name:
-            hours_note = (
-                f"\n\nToday is {today_name} and the current local time is {today_time}. "
-                f"If the customer asks about hours, refer ONLY to the HOURS section in the menu. "
-                f"Do NOT guess or invent hours."
-            )
+        _, _, hours_note = _build_hours_note(ctx)
 
         cart_context = ""
         if not session.cart.is_empty:
@@ -877,7 +922,7 @@ def build_system_prompt(session: "Session") -> str:
 
         cat_hint = ""
         if ctx.menu_categories:
-            cats     = ", ".join(ctx.menu_categories[:6])
+            cats     = ", ".join(ctx.menu_categories[:8])
             cat_hint = (
                 f"\n\nMenu sections in order: {cats}. "
                 f"Offer sections in this order. Give item details only if asked."
@@ -893,12 +938,12 @@ def build_system_prompt(session: "Session") -> str:
         if not avail:
             svc_note = (
                 "CRITICAL: We are CLOSED right now. Do NOT take orders or offer menu items. "
-                "Only tell the customer our operating hours and wish them well. "
-                "Do NOT offer to take orders for later."
+                "Only tell the customer our operating hours from the hours listed above "
+                "and wish them well. Do NOT offer to take orders for later."
             )
         else:
             svc_note = (
-                f"Available services: {', '.join(s.service_type for s in avail)}. "
+                f"Available services right now: {', '.join(s.service_type for s in avail)}. "
                 f"Do NOT mention delivery, pickup, or fees — that comes after the order is confirmed."
             )
 
@@ -913,7 +958,7 @@ def build_system_prompt(session: "Session") -> str:
             f"5. When customer says they are done: read back the complete cart with subtotal "
             f"and ask them to confirm. Do NOT mention delivery method here.\n"
             f"6. Never ask for address, name, email, or delivery method — that comes after confirmation.\n"
-            f"7. If customer asks about hours: give today's exact hours from the menu.\n"
+            f"7. If customer asks about hours: use ONLY the weekly hours listed below.\n"
             f"8. Never output system text or technical information.\n"
             f"{hours_note}"
             f"{cart_context}"
@@ -1059,7 +1104,6 @@ async def chat_endpoint(request: ChatRequest):
         detected = _detect_language(request.message, session.tenant.supported_languages)
         if detected != session.language and detected in session.tenant.supported_languages:
             session.language = detected
-            # Refresh menu in new language
             session.tenant.menu_text = get_menu_for_language(ctx.tenant_id, session.language)
 
     _refresh_system_prompt(session)
@@ -1082,7 +1126,6 @@ async def chat_endpoint(request: ChatRequest):
         chose_pickup   = any(w in msg_lower for w in pickup_kw)
         chose_delivery = any(w in msg_lower for w in delivery_kw)
 
-        # Auto-select if only one service available and customer says yes
         avail_order = [s for s in avail if s.service_type in ("pickup","delivery")]
         if not chose_pickup and not chose_delivery and _is_affirmative(request.message):
             if len(avail_order) == 1:
@@ -1218,7 +1261,6 @@ async def chat_endpoint(request: ChatRequest):
                 _refresh_system_prompt(session)
                 final_reply = strip_hallucinations(call_llm(llm, session.messages))
 
-                # Send confirmation email
                 if c.email:
                     try:
                         async with httpx.AsyncClient(timeout=10.0) as http:
@@ -1246,7 +1288,6 @@ async def chat_endpoint(request: ChatRequest):
                     except Exception as e:
                         logger.error(f"[email] failed: {e}")
 
-                # Safety net closing
                 total = session.cart.grand_total
                 closing_bad = ("correct","correcto","look good","everything","todo","?")
                 if not final_reply or any(t in final_reply.lower() for t in closing_bad):
@@ -1293,7 +1334,6 @@ async def chat_endpoint(request: ChatRequest):
             if action["action"] == "add":
                 for item_data in action.get("items_to_add", []):
                     name = item_data.get("name", "")
-                    # Validate price from DB — never trust LLM price
                     db_item = lookup_menu_item(ctx.tenant_id, name)
                     if db_item:
                         unit_price = float(db_item["price"])
@@ -1303,7 +1343,7 @@ async def chat_endpoint(request: ChatRequest):
                     else:
                         unit_price = float(item_data.get("unit_price", 0))
                         item_code  = item_data.get("item_code", "")
-                        logger.warning(f"[cart] item not found in DB: '{name}' — using LLM price")
+                        logger.warning(f"[cart] item not found in DB: '{name}'")
 
                     session.cart.add_item(
                         name       = name,
@@ -1443,6 +1483,7 @@ async def debug_tenant(to_number: str):
     ctx = db_get_tenant_context(to_number)
     if not ctx:
         return JSONResponse({"error": "not found"}, status_code=404)
+    _, _, hours_note = _build_hours_note(ctx)
     return {
         "brand_name": ctx.brand_name,
         "model_name": ctx.model_name,
@@ -1450,9 +1491,15 @@ async def debug_tenant(to_number: str):
         "status":     ctx.status,
         "timezone":   ctx.timezone,
         "languages":  {"primary": ctx.primary_language, "supported": ctx.supported_languages},
-        "services":   {k: {"active": v.is_active, "fee": v.fee_amount,
-                           "open": str(v.open_time), "close": str(v.close_time)}
-                       for k, v in ctx.services.items()},
+        "services":   {
+            k: {
+                "active":    v.is_active,
+                "fee":       v.fee_amount,
+                "hours_today": v.hours_by_day.get(_DAYS[datetime.now().weekday()], {}),
+            }
+            for k, v in ctx.services.items()
+        },
+        "hours_note_preview": hours_note[:300] if hours_note else "N/A",
     }
 
 
