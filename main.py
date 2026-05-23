@@ -274,7 +274,7 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
         row = conn.execute(text("""
             SELECT
                 t.id, t.brand_name, t.status,
-                t.physical_address, t.city, t.state, t.country,
+                t.physical_address, t.city, t.state, t.country, t.timezone, 
                 s.system_prompt, s.primary_language, s.supported_languages,
                 m.model_name, m.api_key, m.provider
             FROM tenants t
@@ -297,7 +297,7 @@ def db_get_tenant_context(to_number: str) -> Optional[TenantContext]:
         model_name          = row["model_name"],
         api_key             = row["api_key"],
         provider            = row["provider"] or "groq",
-        timezone            = "America/Toronto",
+        timezone            = row["timezone"] or ""
         physical_address    = row["physical_address"] or "",
         city                = row["city"] or "",
         state               = row["state"] or "",
@@ -482,6 +482,12 @@ def _extract_menu_categories(menu_text: str) -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_timezone_from_address(llm: LLMProvider, ctx: TenantContext) -> str:
+    # If timezone already configured in DB, use it directly
+    if ctx.timezone and "/" in ctx.timezone:
+        logger.info(f"[tz] using DB timezone: {ctx.timezone}")
+        return ctx.timezone
+
+    # Otherwise resolve via LLM from address
     location = f"{ctx.city}, {ctx.state}, {ctx.country}"
     try:
         tz = llm.classify(
@@ -489,12 +495,16 @@ def _resolve_timezone_from_address(llm: LLMProvider, ctx: TenantContext) -> str:
             f"Reply with ONLY the timezone string, e.g. America/Toronto. No explanation.",
             max_tokens=30,
         ).strip().strip('"').strip("'")
+        tz = "/".join(part.capitalize() for part in tz.split("/"))
         if "/" in tz and len(tz) < 50:
-            logger.info(f"[tz] {location} → {tz}")
+            logger.info(f"[tz] resolved {location} → {tz}")
             return tz
     except Exception as e:
         logger.error(f"[tz] error: {e}")
-    return "America/Toronto"
+
+    # Last resort fallback — log a warning
+    logger.warning(f"[tz] could not resolve timezone for {ctx.city}, {ctx.country} — defaulting to UTC")
+    return "UTC"
 
 
 def _check_service_availability(ctx: TenantContext) -> None:
