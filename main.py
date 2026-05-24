@@ -1,26 +1,26 @@
 """
-SaaS Restaurant Multi-Tenant Chat API — v4.11
+SaaS Restaurant Multi-Tenant Chat API — v4.12
 ==============================================
-ALBERTO
-Changes from v4.10:
-  - ORDER AUDITING:
-    * `orders.payment_method` (card | interac | e_transfer | cash) with a
-      database-level constraint enforcing "cash only on pickup orders".
-    * `orders.payment_status` (pending | paid | failed | refunded).
-    * Timestamps for the full lifecycle: paid_at, prepared_at,
-      out_for_delivery_at, delivered_at, cancelled_at + cancellation_reason.
-    * `orders.status` now uses a strict workflow: pending → confirmed →
-      preparing → ready → out_for_delivery → delivered (or cancelled).
-  - TAX PER-ITEM saved on order_items: is_tax_exempt, tax_rate, tax_amount.
-    The aggregated 'tax' line_type row is kept for backward compatibility.
-  - REPORTING ENDPOINTS:
-    * GET    /orders/{order_number}                   — full order detail
-    * GET    /tenants/{tenant_id}/orders              — list with filters
-    * GET    /tenants/{tenant_id}/orders/today        — today's snapshot
-    * PATCH  /orders/{order_number}/status            — update workflow status
-    * PATCH  /orders/{order_number}/payment           — set method/status/paid_at
-    * POST   /orders/{order_number}/cancel            — cancel with reason
-  - Required migration: migration_v4.11.sql
+Changes from v4.11:
+  - ARCHITECTURE: Separate system-level classifier provider.
+    * New env vars: CLASSIFIER_PROVIDER, CLASSIFIER_API_KEY, CLASSIFIER_MODEL.
+    * All classifiers (_extract_order_action, _classify_intent,
+      _classify_confirmation, _resolve_timezone_from_address) now use the
+      system classifier LLM (Groq recommended for speed & cost).
+    * Tenant's own LLM is reserved for conversational replies (where the
+      brand voice matters). Falls back to tenant LLM if env vars not set.
+  - PARSER ROBUSTNESS: _extract_order_action now retries once when the LLM
+    returns an empty markdown fence (``` followed by nothing). This was the
+    root cause of the "carne asada never added but bot lied" bug.
+  - ANTI-HALLUCINATION: Order-state system prompt now hard-states that the
+    cart is the source of truth and the LLM must never claim it added,
+    modified, or removed items that don't appear in the CURRENT CART block.
+  - CUSTOMER DEFENSE: db_get_customer now ignores phone-like full_name
+    values (10+ digits) coming from legacy corrupted records. The chat
+    flow will treat such customers as needing name collection.
+  - MAPBOX UNIT PRESERVATION: Address validation now extracts unit/apt/suite
+    numbers from the input before geocoding and re-attaches them to the
+    canonical result so the courier knows which unit to deliver to.
 """
 
 import os
@@ -58,12 +58,53 @@ logger = logging.getLogger("restaurant_api")
 DATABASE_URL = os.getenv("DATABASE_URL")
 MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
 
+# ── System-level classifier provider (optional; falls back to tenant LLM) ──
+# Set these env vars to dedicate a small/fast model to classification tasks.
+# Recommended: Groq Llama 3.1 8B for ~10x speed and ~60x cost reduction.
+CLASSIFIER_PROVIDER = os.getenv("CLASSIFIER_PROVIDER", "").strip().lower()
+CLASSIFIER_API_KEY  = os.getenv("CLASSIFIER_API_KEY", "").strip()
+CLASSIFIER_MODEL    = os.getenv("CLASSIFIER_MODEL", "").strip()
+
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set.")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
-app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.11.0")
+app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.12.0")
 app.include_router(notifications_router)
+
+# Singleton instance of the system classifier LLM (None if not configured)
+_CLASSIFIER_LLM: Optional[LLMProvider] = None
+
+
+def _init_classifier_llm() -> None:
+    """Initialize the system-wide classifier LLM if env vars are set."""
+    global _CLASSIFIER_LLM
+    if CLASSIFIER_PROVIDER and CLASSIFIER_API_KEY and CLASSIFIER_MODEL:
+        try:
+            _CLASSIFIER_LLM = get_provider(
+                CLASSIFIER_PROVIDER, CLASSIFIER_API_KEY, CLASSIFIER_MODEL
+            )
+            logger.info(
+                f"[classifier_llm] initialized: provider={CLASSIFIER_PROVIDER} "
+                f"model={CLASSIFIER_MODEL}"
+            )
+        except Exception as e:
+            logger.error(f"[classifier_llm] init failed, falling back to tenant LLM: {e}")
+            _CLASSIFIER_LLM = None
+    else:
+        logger.info(
+            "[classifier_llm] not configured (CLASSIFIER_PROVIDER/API_KEY/MODEL not set); "
+            "using tenant LLM for classification"
+        )
+
+
+def _classifier_or_tenant(tenant_llm: LLMProvider) -> LLMProvider:
+    """
+    Returns the system classifier LLM if configured, otherwise the tenant's.
+    This lets every tenant get the speed/cost benefit of a small classifier
+    while still using their chosen model for conversational replies.
+    """
+    return _CLASSIFIER_LLM if _CLASSIFIER_LLM is not None else tenant_llm
 
 TEMPERATURE       = 0.1
 MAX_TOKENS        = 400
@@ -77,6 +118,9 @@ _DAY_NAMES = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sun
 
 # Cache of geocoded tenant proximity coords: tenant_id -> "lng,lat"
 _TENANT_PROXIMITY: dict[str, str] = {}
+
+# Initialize the system-wide classifier LLM at import time (if configured)
+_init_classifier_llm()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -466,10 +510,21 @@ def db_get_customer(from_number: str, tenant_id: str) -> dict:
     if not row:
         return {"is_global": False, "is_tenant": False,
                 "full_name": "", "email": "", "address_line_1": "", "customer_id": None}
+
+    # Defense: ignore full_name that looks like a phone number (legacy bug from
+    # v4.7 where the bot incorrectly asked for phone and stored it as name).
+    full_name = row["full_name"] or ""
+    if re.match(r"^\+?\d{7,}$", full_name.strip()):
+        logger.warning(
+            f"[db_get_customer] ignoring phone-like full_name='{full_name}' "
+            f"for phone={from_number} (data hygiene)"
+        )
+        full_name = ""
+
     return {
         "is_global":      True,
         "is_tenant":      row["tc_id"] is not None,
-        "full_name":      row["full_name"] or "",
+        "full_name":      full_name,
         "email":          row["email"] or "",
         "address_line_1": row["address_line_1"] or "",
         "customer_id":    str(row["customer_id"]),
@@ -734,9 +789,10 @@ def _resolve_timezone_from_address(llm: LLMProvider, ctx: TenantContext) -> str:
     if ctx.timezone and "/" in ctx.timezone:
         logger.info(f"[tz] using DB timezone: {ctx.timezone}")
         return ctx.timezone
+    classifier = _classifier_or_tenant(llm)
     location = f"{ctx.city}, {ctx.state}, {ctx.country}"
     try:
-        tz = llm.classify(
+        tz = classifier.classify(
             f"What is the IANA timezone identifier for: {location}? "
             f"Reply with ONLY the timezone string, e.g. America/Toronto. No explanation.",
             max_tokens=30,
@@ -950,20 +1006,56 @@ def _country_to_mapbox_code(country: str) -> str:
     return "ca,us"
 
 
+_UNIT_PATTERNS = [
+    # "unit 1710", "unit #1710", "apt 5B", "apartment 12", "suite 200", "# 1710"
+    re.compile(r"\b(?:unit|apt|apartment|suite|ste)\.?\s*#?\s*([A-Za-z0-9\-]+)\b", re.IGNORECASE),
+    # Standalone leading "#1710" before a comma (must be followed by comma or end)
+    re.compile(r"^#\s*([A-Za-z0-9\-]+)\s*(?=,)", re.IGNORECASE),
+    # "1710-273 Pharmacy" pattern (unit-streetnum prefix)
+    re.compile(r"^(\d{2,5})\s*[-–]\s*(?=\d)", re.IGNORECASE),
+]
+
+def _extract_unit(address: str) -> tuple[str, str]:
+    """
+    If the address mentions a unit/apt/suite, extract it and return
+    (clean_address_without_unit, unit_string).
+    If no unit detected, returns (address_as_is, '').
+    """
+    for pattern in _UNIT_PATTERNS:
+        m = pattern.search(address)
+        if m:
+            unit = m.group(1).strip()
+            # Remove the matched portion, plus any surrounding commas/whitespace
+            clean = pattern.sub("", address, count=1)
+            clean = re.sub(r"^\s*,\s*", "", clean)         # leading comma
+            clean = re.sub(r",\s*,", ",", clean)           # double commas
+            clean = re.sub(r"\s+", " ", clean).strip(", ")
+            if unit:
+                return clean, unit
+    return address, ""
+
+
 async def validate_address_mapbox(address: str, ctx: TenantContext) -> dict:
     """
     Validates an address using Mapbox geocoding, biased to the tenant's location.
     Threshold is MAPBOX_THRESHOLD. If a delivery_radius_km is configured on
     the delivery service, also checks that the address is within that radius.
 
+    Preserves unit/apt numbers across geocoding (Mapbox strips them).
+
     Returns dict with: valid, canonical, suggestions, relevance,
-    out_of_zone (bool), distance_km (float|None).
+    out_of_zone (bool), distance_km (float|None), unit (str).
     """
     if not MAPBOX_TOKEN:
         return {"valid": True, "canonical": address, "suggestions": [],
-                "relevance": 1.0, "out_of_zone": False, "distance_km": None}
+                "relevance": 1.0, "out_of_zone": False, "distance_km": None, "unit": ""}
 
-    parts = [address]
+    # Extract unit/apt before geocoding (Mapbox doesn't handle these well)
+    base_address, unit = _extract_unit(address)
+    if unit:
+        logger.info(f"[mapbox] extracted unit='{unit}' from address; base='{base_address}'")
+
+    parts = [base_address]
     if ctx.city:    parts.append(ctx.city)
     if ctx.state:   parts.append(ctx.state)
     query = ", ".join(parts)
@@ -992,24 +1084,33 @@ async def validate_address_mapbox(address: str, ctx: TenantContext) -> dict:
 
         if not features:
             return {"valid": False, "canonical": "", "suggestions": [],
-                    "relevance": 0.0, "out_of_zone": False, "distance_km": None}
+                    "relevance": 0.0, "out_of_zone": False, "distance_km": None, "unit": unit}
 
         top       = features[0]
         relevance = top.get("relevance", 0)
-        canonical = top.get("place_name", address)
-        center    = top.get("center", [None, None])
+        canonical = top.get("place_name", base_address)
+
+        # Re-attach unit to canonical for delivery instructions
+        if unit:
+            canonical = f"Unit {unit}, {canonical}"
+
+        center = top.get("center", [None, None])
         addr_lng, addr_lat = center if len(center) == 2 else (None, None)
 
-        logger.info(f"[mapbox] top relevance={relevance} place={canonical[:80]}")
+        logger.info(f"[mapbox] top relevance={relevance} place={canonical[:100]}")
 
         if relevance < MAPBOX_THRESHOLD:
             return {
                 "valid":       False,
                 "canonical":   canonical,
-                "suggestions": [f["place_name"] for f in features[:3]],
+                "suggestions": [
+                    (f"Unit {unit}, " if unit else "") + f["place_name"]
+                    for f in features[:3]
+                ],
                 "relevance":   relevance,
                 "out_of_zone": False,
                 "distance_km": None,
+                "unit":        unit,
             }
 
         # Address found — now check delivery radius if configured
@@ -1033,15 +1134,19 @@ async def validate_address_mapbox(address: str, ctx: TenantContext) -> dict:
         return {
             "valid":       not out_of_zone,
             "canonical":   canonical,
-            "suggestions": [f["place_name"] for f in features[:3]],
+            "suggestions": [
+                (f"Unit {unit}, " if unit else "") + f["place_name"]
+                for f in features[:3]
+            ],
             "relevance":   relevance,
             "out_of_zone": out_of_zone,
             "distance_km": distance_km,
+            "unit":        unit,
         }
     except Exception as e:
         logger.error(f"[mapbox] Error: {e}")
         return {"valid": True, "canonical": address, "suggestions": [],
-                "relevance": 0.0, "out_of_zone": False, "distance_km": None}
+                "relevance": 0.0, "out_of_zone": False, "distance_km": None, "unit": unit}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1050,8 +1155,23 @@ async def validate_address_mapbox(address: str, ctx: TenantContext) -> dict:
 
 def _extract_order_action(llm: LLMProvider, message: str, cart: OrderCart,
                           menu_text: str, tenant_id: str) -> dict:
+    """
+    Classifies the customer message into an order action. Uses the system
+    classifier LLM if configured, else the tenant's LLM. Retries once if
+    the first attempt returns an empty markdown fence (common Claude failure).
+    """
+    classifier = _classifier_or_tenant(llm)
     cart_display = cart.to_display() if not cart.is_empty else "Empty cart"
-    prompt = f"""You extract structured order actions from a customer message in a restaurant chat. You ALWAYS respond with valid JSON only.
+
+    def _build_prompt(strict_retry: bool = False) -> str:
+        strict_preamble = ""
+        if strict_retry:
+            strict_preamble = (
+                "CRITICAL: Your last reply was an empty markdown fence (```json with no content). "
+                "DO NOT do that again. Output a single JSON object directly — no markdown, "
+                "no code fences, no commentary. Just the JSON. Start with { and end with }.\n\n"
+            )
+        return f"""{strict_preamble}You extract structured order actions from a customer message in a restaurant chat. You ALWAYS respond with valid JSON only.
 
 CURRENT CART:
 {cart_display}
@@ -1062,18 +1182,20 @@ MENU (use these EXACT item_code and name values — never invent):
 CUSTOMER MESSAGE: "{message}"
 
 Decide ONE action:
-- "add"     → customer wants to ADD one or more items (e.g. "I'd like 2 pupusas", "give me a horchata", "add a tamarindo")
+- "add"     → customer wants to ADD one or more items (e.g. "I'd like 2 pupusas", "give me a horchata", "add a tamarindo", "I wanna carne asada for me and one for my wife", "lemme get a coke")
 - "remove"  → customer wants to REMOVE an item from the cart (e.g. "remove the horchata", "take off the soda")
-- "modify"  → customer wants to CHANGE quantity or prep notes of an item ALREADY in cart (e.g. "make it 3 instead of 2", "no onions on the pupusa")
+- "modify"  → customer wants to CHANGE quantity or prep notes of an item ALREADY in cart (e.g. "make it 3 instead of 2", "no onions on the pupusa", "my wife wants onions on her carne asada")
 - "confirm" → customer is done and confirms the cart (e.g. "that's everything", "that's all", "ok", "yes that's it", "ready to checkout")
 - "inquiry" → customer asks a QUESTION about menu/hours/ingredients without ordering (e.g. "what drinks do you have?", "is it spicy?")
 - "unclear" → truly cannot tell
 
 CRITICAL RULES:
-- If the message contains a menu item name with a quantity word (one, two, 2, 3, a, an) OR phrases like "I want", "I'd like", "give me", "add", "also", "and", "plus" followed by an item → action is "add".
-- Match menu items loosely (e.g. "pupusa revuelta" → find "Pupusa Revuelta", "horchata" → find "Horchata Salvadoreña"). Use the closest match from the menu.
+- If the message contains a menu item name with a quantity word (one, two, 2, 3, a, an) OR phrases like "I want", "I'd like", "give me", "add", "also", "and", "plus", "I wanna", "lemme get", "I'll have" followed by an item → action is "add".
+- "X for me and one for my wife" / "one for me and one for X" → quantity is 2 of the same item.
+- "X for me, Y for my wife" (DIFFERENT items) → add BOTH.
+- Match menu items loosely (e.g. "pupusa revuelta" → find "Pupusa Revuelta", "horchata" → find "Horchata Salvadoreña", "carne asada" → find "Carne Asada"). Use the closest match from the menu.
 - For quantities: "a" / "an" / "one" = 1, "two" = 2, "three" = 3, etc.
-- For "modify": only use this if the item is ALREADY in the cart and the customer wants to change it.
+- For "modify": only use this if the item is ALREADY in the cart and the customer wants to change it. If they want to modify an item that ISN'T in the cart, treat it as "add" with the prep_notes set.
 - Never invent item_code or name values that aren't in the menu above.
 
 EXAMPLES:
@@ -1082,10 +1204,13 @@ Message: "I'd like 2 pupusas revueltas"
 {{"action":"add","items_to_add":[{{"item_code":"PUP-001","name":"Pupusa Revuelta","quantity":2,"prep_notes":""}}],"items_to_remove":[],"items_to_modify":[]}}
 
 Message: "add 1 horchata please"
-{{"action":"add","items_to_add":[{{"item_code":"BEV-001","name":"Horchata Salvadoreña","quantity":1,"prep_notes":""}}],"items_to_remove":[],"items_to_modify":[]}}
+{{"action":"add","items_to_add":[{{"item_code":"DRK-001","name":"Horchata Salvadoreña","quantity":1,"prep_notes":""}}],"items_to_remove":[],"items_to_modify":[]}}
 
 Message: "also 1 pupusa de queso, no onions"
 {{"action":"add","items_to_add":[{{"item_code":"PUP-003","name":"Pupusa Solo Queso","quantity":1,"prep_notes":"no onions"}}],"items_to_remove":[],"items_to_modify":[]}}
+
+Message: "I wanna carne asada for me and one for my wife"
+{{"action":"add","items_to_add":[{{"item_code":"MAIN-001","name":"Carne Asada","quantity":2,"prep_notes":""}}],"items_to_remove":[],"items_to_modify":[]}}
 
 Message: "give me one tamarindo"
 {{"action":"add","items_to_add":[{{"item_code":"DRK-004","name":"Jugo de Tamarindo","quantity":1,"prep_notes":""}}],"items_to_remove":[],"items_to_modify":[]}}
@@ -1102,6 +1227,9 @@ Message: "remove the horchata"
 Message: "actually make it 3 pupusas revueltas instead of 2"
 {{"action":"modify","items_to_add":[],"items_to_remove":[],"items_to_modify":[{{"name":"Pupusa Revuelta","prep_notes":"","quantity":3}}]}}
 
+Message: "my wife wants onions on her carne asada"
+{{"action":"modify","items_to_add":[],"items_to_remove":[],"items_to_modify":[{{"name":"Carne Asada","prep_notes":"with onions","quantity":0}}]}}
+
 Message: "that's everything"
 {{"action":"confirm","items_to_add":[],"items_to_remove":[],"items_to_modify":[]}}
 
@@ -1110,28 +1238,71 @@ Message: "what drinks do you have?"
 
 Now respond with JSON ONLY for the customer message above. No markdown, no explanation.
 """
-    result = ""
+
+    def _parse(raw: str) -> Optional[dict]:
+        """Try to parse the LLM output. Returns None if it looks like an empty fence."""
+        if not raw:
+            return None
+        # Detect empty markdown fence (the bug pattern we saw in v4.11)
+        stripped = raw.strip()
+        if stripped in ("```json", "```", "```json\n```", "``` ```"):
+            return None
+        # Strip fences if present
+        cleaned = re.sub(r"```json|```", "", stripped).strip()
+        # Empty after cleaning → empty fence
+        if not cleaned:
+            return None
+        # Extract first JSON object
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
+    # First attempt
+    raw1 = ""
     try:
-        result = llm.classify(prompt, max_tokens=CLASSIFIER_TOKENS)
-        logger.info(f"[cart_action_raw] message='{message[:80]}' raw={result[:300] if result else 'EMPTY'}")
-        result = re.sub(r"```json|```", "", result).strip()
-        json_match = re.search(r"\{.*\}", result, re.DOTALL)
-        if json_match:
-            result = json_match.group(0)
-        data = json.loads(result)
-        logger.info(
-            f"[cart_action] action={data.get('action')} "
-            f"add={len(data.get('items_to_add',[]))} "
-            f"remove={len(data.get('items_to_remove',[]))} "
-            f"modify={len(data.get('items_to_modify',[]))}"
-        )
-        return data
+        raw1 = classifier.classify(_build_prompt(strict_retry=False), max_tokens=CLASSIFIER_TOKENS)
+        logger.info(f"[cart_action_raw] message='{message[:80]}' raw={raw1[:300] if raw1 else 'EMPTY'}")
+        data = _parse(raw1)
+        if data is not None:
+            logger.info(
+                f"[cart_action] action={data.get('action')} "
+                f"add={len(data.get('items_to_add',[]))} "
+                f"remove={len(data.get('items_to_remove',[]))} "
+                f"modify={len(data.get('items_to_modify',[]))}"
+            )
+            return data
     except Exception as e:
-        logger.error(f"[extract_order_action] error: {e} raw={result[:300] if result else 'N/A'}")
-        return {"action": "unclear", "items_to_add": [], "items_to_remove": [], "items_to_modify": []}
+        logger.error(f"[extract_order_action] first attempt error: {e}")
+
+    # Retry once with stricter prompt
+    logger.warning(f"[cart_action_retry] first attempt unparseable ({raw1[:100]!r}); retrying with strict prompt")
+    raw2 = ""
+    try:
+        raw2 = classifier.classify(_build_prompt(strict_retry=True), max_tokens=CLASSIFIER_TOKENS)
+        logger.info(f"[cart_action_raw_retry] raw={raw2[:300] if raw2 else 'EMPTY'}")
+        data = _parse(raw2)
+        if data is not None:
+            logger.info(
+                f"[cart_action_retry] action={data.get('action')} "
+                f"add={len(data.get('items_to_add',[]))}"
+            )
+            return data
+    except Exception as e:
+        logger.error(f"[extract_order_action] retry error: {e}")
+
+    logger.error(
+        f"[cart_action_FAIL] both attempts unparseable for message='{message[:80]}'. "
+        f"raw1={raw1[:150]!r} raw2={raw2[:150]!r}"
+    )
+    return {"action": "unclear", "items_to_add": [], "items_to_remove": [], "items_to_modify": []}
 
 
 def _classify_intent(llm: LLMProvider, message: str, context: str) -> str:
+    classifier = _classifier_or_tenant(llm)
     prompt = (
         f"Classify this customer message in a food ordering chat.\n"
         f"Context: {context}\nMessage: \"{message}\"\n\n"
@@ -1143,7 +1314,7 @@ def _classify_intent(llm: LLMProvider, message: str, context: str) -> str:
         f"other — unclear"
     )
     try:
-        result = llm.classify(prompt).split()[0]
+        result = classifier.classify(prompt).split()[0]
         return result if result in ("provide_data","back_to_order","confirm","cancel","other") else "other"
     except Exception as e:
         logger.error(f"[classify_intent] error: {e}")
@@ -1151,6 +1322,7 @@ def _classify_intent(llm: LLMProvider, message: str, context: str) -> str:
 
 
 def _classify_confirmation(llm: LLMProvider, message: str) -> str:
+    classifier = _classifier_or_tenant(llm)
     prompt = (
         f"Is this message a confirmation (yes), rejection (no), or something else?\n"
         f"Message: \"{message}\"\n"
@@ -1159,7 +1331,7 @@ def _classify_confirmation(llm: LLMProvider, message: str) -> str:
         f"Reply with ONE word: yes, no, or other."
     )
     try:
-        result = llm.classify(prompt).split()[0]
+        result = classifier.classify(prompt).split()[0]
         return result if result in ("yes","no","other") else "other"
     except Exception as e:
         logger.error(f"[classify_confirm] error: {e}")
@@ -1232,7 +1404,12 @@ def _extract_name(raw: str) -> str:
         if stripped.lower().startswith(prefix):
             stripped = stripped[len(prefix):]
             break
-    return stripped.strip().title()
+    stripped = stripped.strip()
+    # Defense: never accept phone-like strings as a name
+    if re.match(r"^\+?\d{7,}$", stripped):
+        logger.warning(f"[extract_name] rejected phone-like input as name: {stripped!r}")
+        return ""
+    return stripped.title()
 
 
 _EMAIL_RE   = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
@@ -1364,7 +1541,8 @@ def build_system_prompt(session: "Session") -> str:
         empty_cart_warning = ""
         if not session.cart.is_empty:
             cart_context = (
-                f"\n\nCURRENT ORDER IN CART:\n{session.cart.to_display(lang)}\n"
+                f"\n\nCURRENT ORDER IN CART (this is the ONLY source of truth):\n"
+                f"{session.cart.to_display(lang)}\n"
                 f"The customer can add, remove, or modify items at any time."
             )
         else:
@@ -1376,6 +1554,19 @@ def build_system_prompt(session: "Session") -> str:
                 "or give an address, gently redirect them: tell them you first need to "
                 "know what they'd like to order from the menu."
             )
+
+        # ─── CRITICAL anti-hallucination rule ───────────────────────────────
+        hallu_guard = (
+            "\n\n🚫 CRITICAL — NEVER LIE ABOUT THE CART. "
+            "The CURRENT ORDER IN CART section above is the ONLY source of truth. "
+            "You MUST NOT claim that an item was added, removed, or modified "
+            "unless it actually appears (or no longer appears) in that section. "
+            "If the system did not add an item the customer requested (because "
+            "of a parsing issue), the cart will be empty or unchanged — in that case "
+            "you should ASK THE CUSTOMER TO REPHRASE rather than pretend it was added. "
+            "Do NOT invent quantities, prices, or items not in the cart section. "
+            "Do NOT say 'you already have X from before' unless X is literally listed above."
+        )
 
         # Channel-aware tone instruction
         channel_note = ""
@@ -1438,6 +1629,7 @@ def build_system_prompt(session: "Session") -> str:
             f"{hours_note}"
             f"{cart_context}"
             f"{empty_cart_warning}"
+            f"{hallu_guard}"
             f"{cat_hint}\n\n{svc_note}\n\nFULL MENU:\n{ctx.menu_text}"
         )
 
@@ -2179,6 +2371,21 @@ async def clear_proximity_cache():
     n = len(_TENANT_PROXIMITY)
     _TENANT_PROXIMITY.clear()
     return {"cleared": n}
+
+
+@app.get("/debug/classifier")
+async def debug_classifier():
+    """Returns info about the active classifier LLM (system-level or per-tenant)."""
+    return {
+        "system_classifier_active": _CLASSIFIER_LLM is not None,
+        "provider": CLASSIFIER_PROVIDER if _CLASSIFIER_LLM else "(per-tenant LLM)",
+        "model":    CLASSIFIER_MODEL    if _CLASSIFIER_LLM else "(varies)",
+        "note": (
+            "Set CLASSIFIER_PROVIDER, CLASSIFIER_API_KEY, and CLASSIFIER_MODEL "
+            "env vars to enable a system-wide classifier. Recommended: "
+            "Groq Llama 3.1 8B for speed & cost."
+        ) if not _CLASSIFIER_LLM else None,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
