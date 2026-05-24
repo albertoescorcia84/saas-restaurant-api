@@ -1,26 +1,30 @@
 """
-SaaS Restaurant Multi-Tenant Chat API — v4.12
+SaaS Restaurant Multi-Tenant Chat API — v4.13
 ==============================================
-Changes from v4.11:
-  - ARCHITECTURE: Separate system-level classifier provider.
-    * New env vars: CLASSIFIER_PROVIDER, CLASSIFIER_API_KEY, CLASSIFIER_MODEL.
-    * All classifiers (_extract_order_action, _classify_intent,
-      _classify_confirmation, _resolve_timezone_from_address) now use the
-      system classifier LLM (Groq recommended for speed & cost).
-    * Tenant's own LLM is reserved for conversational replies (where the
-      brand voice matters). Falls back to tenant LLM if env vars not set.
-  - PARSER ROBUSTNESS: _extract_order_action now retries once when the LLM
-    returns an empty markdown fence (``` followed by nothing). This was the
-    root cause of the "carne asada never added but bot lied" bug.
-  - ANTI-HALLUCINATION: Order-state system prompt now hard-states that the
-    cart is the source of truth and the LLM must never claim it added,
-    modified, or removed items that don't appear in the CURRENT CART block.
-  - CUSTOMER DEFENSE: db_get_customer now ignores phone-like full_name
-    values (10+ digits) coming from legacy corrupted records. The chat
-    flow will treat such customers as needing name collection.
-  - MAPBOX UNIT PRESERVATION: Address validation now extracts unit/apt/suite
-    numbers from the input before geocoding and re-attaches them to the
-    canonical result so the courier knows which unit to deliver to.
+Changes from v4.12:
+  - SESSION DECOUPLING (architectural):
+    * Sessions are now keyed by `session_id` (UUID), NOT by `from_number`.
+    * ChatRequest accepts optional `session_id`; response always returns
+      one (in body AND in `X-Session-Id` header).
+    * Multiple concurrent sessions per from_number are now possible.
+    * Customer DB record (keyed by phone_number) remains intact for
+      returning-customer recognition.
+    * Forces a new session when:
+      - No session_id provided
+      - session_id is unknown or expired
+      - session.status == DONE
+      - Customer says "hello"/"hi"/"hola" etc.
+  - SESSION MANAGEMENT:
+    * POST /session/new — explicitly start a new session (no greeting needed)
+    * GET /debug/sessions/stats — monitor session pool
+    * Auto-cleanup background task: DONE sessions older than 1h, idle
+      sessions older than 30 min, removed every 10 minutes.
+    * Each session tracks last_activity_at timestamp.
+  - FIX: "with with onions" duplication in _natural_items (detects if
+    prep_notes already starts with "with"/"con" before prepending).
+  - FIX: Customer correction in FINAL_CONFIRM ("wait, I forgot the X")
+    now routes back to ORDER state instead of silently re-showing the summary.
+  - LOGGING: Most log lines now prefix with [sid=<8char>] for traceability.
 """
 
 import os
@@ -28,15 +32,16 @@ import re
 import uuid
 import json
 import math
+import asyncio
 import logging
 import httpx
 import zoneinfo as zi
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -69,7 +74,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set.")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
-app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.12.0")
+app    = FastAPI(title="SaaS Restaurant Multi-Tenant API", version="4.13.0")
 app.include_router(notifications_router)
 
 # Singleton instance of the system classifier LLM (None if not configured)
@@ -112,6 +117,11 @@ SEED              = 42
 CLASSIFIER_TOKENS = 400
 CLASSIFIER_TEMP   = 0.0
 MAPBOX_THRESHOLD  = 0.5
+
+# Session lifetime configuration
+SESSION_IDLE_MAX_MIN   = 30   # active session idle for this long → expired
+SESSION_DONE_MAX_MIN   = 60   # DONE session kept around this long for re-fetch
+SESSION_CLEANUP_EVERY  = 600  # background cleanup interval in seconds (10 min)
 
 _DAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
 _DAY_NAMES = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
@@ -364,6 +374,7 @@ class Session:
     session_id:         str
     tenant_id:          str
     tenant:             TenantContext
+    from_number:        str           = ""   # customer phone (for DB lookup, NOT for keying)
     cart:               OrderCart     = field(default_factory=OrderCart)
     status:             State         = State.ORDER
     checkout_field:     CheckoutField = CheckoutField.ADDRESS
@@ -375,8 +386,17 @@ class Session:
     is_tenant_customer: bool          = False
     had_address:        bool          = False
     address_attempts:   int           = 0
+    created_at:         datetime      = field(default_factory=datetime.utcnow)
+    last_activity_at:   datetime      = field(default_factory=datetime.utcnow)
+
+    def touch(self) -> None:
+        """Update last_activity_at to NOW."""
+        self.last_activity_at = datetime.utcnow()
 
 
+# Sessions are now keyed by session_id (UUID), NOT by from_number.
+# This allows multiple concurrent sessions per phone number (different orders,
+# different browser tabs, voice + chat at the same time, etc.).
 _sessions: dict[str, Session] = {}
 
 
@@ -384,7 +404,14 @@ class ChatRequest(BaseModel):
     to_number:   str
     from_number: str
     message:     str
-    channel:     str = "chat"   # "chat" | "voice"
+    channel:     str = "chat"            # "chat" | "voice"
+    session_id:  Optional[str] = None    # If provided, continues that session
+
+
+class NewSessionRequest(BaseModel):
+    to_number:   str
+    from_number: str
+    channel:     str = "chat"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1468,8 +1495,22 @@ def _build_final_confirm_summary(session: "Session") -> str:
             else:
                 part = f"{qty} {display}"
             if it.prep_notes:
-                connector = " con " if lang == "es" else " with "
-                part += f"{connector}{it.prep_notes}"
+                notes = it.prep_notes.strip()
+                # Detect if notes already start with the connector word (e.g., "with onions",
+                # "without cheese", "con cebolla", "sin queso") and avoid duplication.
+                notes_lower = notes.lower()
+                already_has_connector = (
+                    notes_lower.startswith("with ")    or
+                    notes_lower.startswith("without ") or
+                    notes_lower.startswith("no ")      or
+                    notes_lower.startswith("con ")     or
+                    notes_lower.startswith("sin ")
+                )
+                if already_has_connector:
+                    part += f" {notes}"
+                else:
+                    connector = " con " if lang == "es" else " with "
+                    part += f"{connector}{notes}"
             parts.append(part)
         if not parts:
             return ""
@@ -1711,7 +1752,7 @@ def strip_hallucinations(txt: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/chat")
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(request: ChatRequest, response: Response):
     user_phone = request.from_number
 
     ctx = db_get_tenant_context(request.to_number)
@@ -1720,7 +1761,10 @@ async def chat_endpoint(request: ChatRequest):
     if ctx.status != "Active":
         raise HTTPException(403, "Restaurant is currently inactive.")
 
-    session = _sessions.get(user_phone)
+    # ─── Session lookup by session_id (NOT by from_number) ──────────────────
+    incoming_sid = (request.session_id or "").strip()
+    session: Optional[Session] = _sessions.get(incoming_sid) if incoming_sid else None
+
     _GREETINGS = {"hello","hi","hola","hey","buenos dias","buenas","good morning",
                   "good afternoon","good evening","start","restart","nuevo","nueva",
                   "buenas tardes","buenas noches"}
@@ -1731,12 +1775,26 @@ async def chat_endpoint(request: ChatRequest):
     msg_clean      = request.message.strip().lower()
     is_greeting    = msg_clean in _GREETINGS
     is_done_phrase = msg_clean in _DONE_PHRASES
+
+    # Decide whether to start a new session
     need_new_session = (
-        not session
-        or (session.status == State.DONE and not is_done_phrase)
-        or session.tenant_id != ctx.tenant_id
-        or is_greeting
+        not session                                            # no id or unknown id
+        or (session.status == State.DONE and not is_done_phrase)  # previous order completed
+        or session.tenant_id != ctx.tenant_id                  # different tenant
+        or session.from_number != user_phone                   # different customer (session_id was reused wrongly)
+        or is_greeting                                         # explicit "hello" → fresh start
     )
+
+    if incoming_sid and not session:
+        logger.info(f"[session] unknown session_id received '{incoming_sid[:8]}…' → creating new")
+    elif incoming_sid and session and need_new_session:
+        reason = (
+            "DONE" if session.status == State.DONE else
+            "tenant_mismatch" if session.tenant_id != ctx.tenant_id else
+            "from_number_mismatch" if session.from_number != user_phone else
+            "greeting"
+        )
+        logger.info(f"[session] sid={incoming_sid[:8]} discarded ({reason}) → creating new")
 
     llm = get_provider(ctx.provider, ctx.api_key, ctx.model_name)
 
@@ -1748,10 +1806,12 @@ async def chat_endpoint(request: ChatRequest):
         ctx.menu_categories = get_menu_categories(ctx.tenant_id)
         logger.info(f"[menu] categories={ctx.menu_categories}")
         cust = db_get_customer(user_phone, ctx.tenant_id)
+        new_sid = str(uuid.uuid4())
         session = Session(
-            session_id         = str(uuid.uuid4()),
+            session_id         = new_sid,
             tenant_id          = ctx.tenant_id,
             tenant             = ctx,
+            from_number        = user_phone,
             cart               = OrderCart(tenant_default_tax=ctx.default_tax_rate),
             status             = State.ORDER,
             language           = detected_lang,
@@ -1766,18 +1826,25 @@ async def chat_endpoint(request: ChatRequest):
             is_tenant_customer = cust["is_tenant"],
             had_address        = bool(cust["address_line_1"]),
         )
-        _sessions[user_phone] = session
-        logger.info(f"[session] new={session.session_id} provider={ctx.provider} tz={ctx.timezone} channel={session.channel}")
+        _sessions[new_sid] = session
+        logger.info(
+            f"[sid={new_sid[:8]}] new session provider={ctx.provider} "
+            f"tz={ctx.timezone} channel={session.channel} from={user_phone}"
+        )
     else:
         # Update channel if it changed on this request (rare but possible)
         if request.channel and request.channel != session.channel:
-            logger.info(f"[session] channel changed {session.channel} → {request.channel}")
+            logger.info(f"[sid={session.session_id[:8]}] channel changed {session.channel} → {request.channel}")
             session.channel = request.channel
         _check_service_availability(session.tenant)
         detected = _detect_language(request.message, session.tenant.supported_languages)
         if detected != session.language and detected in session.tenant.supported_languages:
             session.language = detected
             session.tenant.menu_text = get_menu_for_language(ctx.tenant_id, session.language)
+
+    # Always update activity and expose session_id in response header
+    session.touch()
+    response.headers["X-Session-Id"] = session.session_id
 
     _refresh_system_prompt(session)
     if len(session.messages) > 21:
@@ -2094,8 +2161,38 @@ async def chat_endpoint(request: ChatRequest):
                 "No worries, let's head back to the order. What would you like to change?"
             )
         else:
-            # Re-show the summary if customer didn't clearly confirm
-            final_reply = _build_final_confirm_summary(session)
+            # ─── Detect "wait, I forgot X" / "I also wanted Y" patterns ─────
+            # When the customer says something that is neither yes nor no but
+            # signals they need to change the cart, route them back to ORDER
+            # state rather than silently re-showing the summary.
+            msg_lower = request.message.lower()
+            back_to_order_signals = (
+                "wait", "espera", "actually", "en realidad",
+                "forgot", "olvid",
+                "also wanted", "tambien quer", "también quer",
+                "i also", "tambien", "también",
+                "add ", "agreg", "añad", "anad",
+                "and ", " and",
+                "missed", "falt", "me falta",
+                "change", "cambi", "cambiar",
+                "remove", "quita", "quitar",
+            )
+            should_route_back = any(sig in msg_lower for sig in back_to_order_signals)
+
+            if should_route_back:
+                logger.info(f"[sid={session.session_id[:8]}] FINAL_CONFIRM → ORDER (back_to_order signal)")
+                session.status = State.ORDER
+                # Tell the customer we're listening and run the message through
+                # the ORDER handler immediately by clearing the deterministic reply
+                # and letting the ORDER state branch handle it on the NEXT message.
+                # For now respond conversationally:
+                if session.language == "es":
+                    final_reply = "¡Claro! Volvamos al pedido un momento. ¿Qué quieres agregar o cambiar?"
+                else:
+                    final_reply = "Of course! Let's hop back to the order. What would you like to add or change?"
+            else:
+                # Re-show the summary if customer didn't clearly confirm
+                final_reply = _build_final_confirm_summary(session)
 
         final_reply = _voice_safe(final_reply, session.channel)
 
@@ -2291,23 +2388,115 @@ def _response(session: Session, reply: str) -> dict:
 # Debug endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.delete("/session/{from_number}")
-async def reset_session(from_number: str):
-    phone = from_number.replace("-", "+")
-    if phone in _sessions:
-        del _sessions[phone]
-        return {"cleared": True, "from_number": phone}
-    return {"cleared": False, "from_number": phone, "reason": "no active session"}
+def _find_sessions_by_phone(phone: str) -> list[Session]:
+    """Helper: find all in-memory sessions for a given from_number."""
+    return [s for s in _sessions.values() if s.from_number == phone]
 
 
-@app.get("/session/{from_number}")
-async def get_session(from_number: str):
-    phone   = from_number.replace("-", "+")
-    session = _sessions.get(phone)
+@app.post("/session/new")
+async def create_session_explicit(req: NewSessionRequest, response: Response):
+    """
+    Explicitly creates a new empty session and returns its session_id.
+    Use this when the frontend wants to start fresh WITHOUT requiring a
+    'hello' message first (e.g. user clicks 'New order' button).
+    """
+    ctx = db_get_tenant_context(req.to_number)
+    if not ctx:
+        raise HTTPException(404, "Restaurant not found.")
+    if ctx.status != "Active":
+        raise HTTPException(403, "Restaurant is currently inactive.")
+
+    # Pseudo-LLM for timezone resolution (uses classifier if configured)
+    llm = get_provider(ctx.provider, ctx.api_key, ctx.model_name)
+    ctx.timezone        = _resolve_timezone_from_address(llm, ctx)
+    _check_service_availability(ctx)
+    ctx.menu_text       = get_menu_for_language(ctx.tenant_id, ctx.primary_language)
+    ctx.menu_categories = get_menu_categories(ctx.tenant_id)
+
+    cust = db_get_customer(req.from_number, ctx.tenant_id)
+    new_sid = str(uuid.uuid4())
+    session = Session(
+        session_id         = new_sid,
+        tenant_id          = ctx.tenant_id,
+        tenant             = ctx,
+        from_number        = req.from_number,
+        cart               = OrderCart(tenant_default_tax=ctx.default_tax_rate),
+        status             = State.ORDER,
+        language           = ctx.primary_language,
+        channel            = req.channel,
+        collected          = CustomerData(
+            full_name   = cust["full_name"],
+            email       = cust["email"],
+            address     = cust["address_line_1"],
+            customer_id = cust["customer_id"],
+        ),
+        is_global_customer = cust["is_global"],
+        is_tenant_customer = cust["is_tenant"],
+        had_address        = bool(cust["address_line_1"]),
+    )
+    _sessions[new_sid] = session
+    response.headers["X-Session-Id"] = new_sid
+    logger.info(f"[sid={new_sid[:8]}] new session (explicit) from={req.from_number}")
+    return {
+        "session_id":     new_sid,
+        "tenant_id":      ctx.tenant_id,
+        "brand_name":     ctx.brand_name,
+        "status":         session.status.value,
+        "channel":        session.channel,
+        "is_returning":   cust["is_global"],
+        "customer_name":  cust["full_name"],
+    }
+
+
+@app.delete("/session/{ident}")
+async def reset_session(ident: str):
+    """
+    Resets a session. Accepts EITHER a session_id (UUID) OR a from_number
+    (with optional '-' instead of '+'). When a phone is passed, ALL active
+    sessions for that phone are cleared.
+    """
+    ident_norm = ident.replace("-", "+")
+
+    # First, try as session_id
+    if ident in _sessions:
+        del _sessions[ident]
+        return {"cleared": True, "by": "session_id", "session_id": ident}
+
+    # Otherwise, treat as from_number and clear all matching sessions
+    to_delete = [sid for sid, s in _sessions.items() if s.from_number == ident_norm]
+    for sid in to_delete:
+        del _sessions[sid]
+    if to_delete:
+        return {
+            "cleared":   True,
+            "by":        "from_number",
+            "from_number": ident_norm,
+            "session_ids_cleared": to_delete,
+            "count": len(to_delete),
+        }
+    return {"cleared": False, "ident": ident, "reason": "no matching session"}
+
+
+@app.get("/session/{ident}")
+async def get_session(ident: str):
+    """
+    Returns a session by session_id OR by from_number (legacy fallback).
+    When a phone matches multiple sessions, returns the most recently active.
+    """
+    ident_norm = ident.replace("-", "+")
+    session: Optional[Session] = _sessions.get(ident)
+    if not session:
+        # Fallback: find most recently active session for this phone
+        matches = _find_sessions_by_phone(ident_norm)
+        if matches:
+            session = max(matches, key=lambda s: s.last_activity_at)
+
     if not session:
         return {"session": None}
+
     return {
         "session_id":     session.session_id,
+        "from_number":    session.from_number,
         "status":         session.status.value,
         "language":       session.language,
         "channel":        session.channel,
@@ -2333,10 +2522,38 @@ async def get_session(from_number: str):
         "tenant_tz":     session.tenant.timezone,
         "services_open": [s.service_type for s in _get_available_services(session.tenant)],
         "message_count": len(session.messages),
+        "created_at":    session.created_at.isoformat(),
+        "last_activity_at": session.last_activity_at.isoformat(),
         "last_messages": [
             {"role": m["role"], "content": (m.get("content") or "")[:120]}
             for m in session.messages[-6:]
         ],
+    }
+
+
+@app.get("/debug/sessions/stats")
+async def sessions_stats():
+    """Snapshot of the in-memory session pool — useful for monitoring."""
+    now = datetime.utcnow()
+    by_status: dict[str, int] = {}
+    oldest_active = None
+    for s in _sessions.values():
+        by_status[s.status.value] = by_status.get(s.status.value, 0) + 1
+        if s.status != State.DONE:
+            if oldest_active is None or s.last_activity_at < oldest_active.last_activity_at:
+                oldest_active = s
+    return {
+        "total_sessions":       len(_sessions),
+        "by_status":            by_status,
+        "oldest_active": {
+            "session_id":       oldest_active.session_id if oldest_active else None,
+            "idle_minutes":     round((now - oldest_active.last_activity_at).total_seconds() / 60, 1) if oldest_active else None,
+        } if oldest_active else None,
+        "config": {
+            "idle_max_min":   SESSION_IDLE_MAX_MIN,
+            "done_max_min":   SESSION_DONE_MAX_MIN,
+            "cleanup_every_sec": SESSION_CLEANUP_EVERY,
+        },
     }
 
 
@@ -2371,6 +2588,49 @@ async def clear_proximity_cache():
     n = len(_TENANT_PROXIMITY)
     _TENANT_PROXIMITY.clear()
     return {"cleared": n}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Background session cleanup
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _session_cleanup_loop():
+    """
+    Periodically prunes the in-memory session pool:
+      - DONE sessions older than SESSION_DONE_MAX_MIN
+      - Non-DONE sessions idle for more than SESSION_IDLE_MAX_MIN
+    """
+    while True:
+        await asyncio.sleep(SESSION_CLEANUP_EVERY)
+        try:
+            now        = datetime.utcnow()
+            done_cut   = now - timedelta(minutes=SESSION_DONE_MAX_MIN)
+            idle_cut   = now - timedelta(minutes=SESSION_IDLE_MAX_MIN)
+            to_delete = []
+            for sid, s in _sessions.items():
+                if s.status == State.DONE and s.last_activity_at < done_cut:
+                    to_delete.append((sid, "done_expired"))
+                elif s.status != State.DONE and s.last_activity_at < idle_cut:
+                    to_delete.append((sid, "idle_expired"))
+            for sid, reason in to_delete:
+                _sessions.pop(sid, None)
+            if to_delete:
+                logger.info(
+                    f"[session_cleanup] removed {len(to_delete)} sessions "
+                    f"(remaining={len(_sessions)})"
+                )
+        except Exception as e:
+            logger.error(f"[session_cleanup] error: {e}")
+
+
+@app.on_event("startup")
+async def _start_session_cleanup():
+    asyncio.create_task(_session_cleanup_loop())
+    logger.info(
+        f"[session_cleanup] task started "
+        f"(every {SESSION_CLEANUP_EVERY}s, "
+        f"idle>{SESSION_IDLE_MAX_MIN}min, done>{SESSION_DONE_MAX_MIN}min)"
+    )
 
 
 @app.get("/debug/classifier")
